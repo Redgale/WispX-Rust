@@ -29,6 +29,10 @@ pub(crate) const UNLIMITED: u64 = u64::MAX;
 /// drains. v1/v2 clients ignore CONTINUE, so this (TCP backpressure) is the only way to bound
 /// memory without dropping data, which is what the reference server does.
 const V2_PAUSE_BYTES: usize = 4 * 1024 * 1024;
+/// WispX: windows below this grow on every turnover, starved reader or not. Small windows mean
+/// a credit (and a wakeup of the sender) every quarter window, which costs real throughput
+/// when many streams are busy; a few MiB per stream is cheap.
+const UNCONDITIONAL_GROWTH_LIMIT: u64 = 4 * 1024 * 1024;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 	// a panic while holding one of these locks leaves the state consistent enough to keep going
@@ -666,14 +670,15 @@ impl MuxShared {
 					let mut increment = state.rx_unacked;
 					state.rx_unacked = 0;
 					// Window auto-tuning, like TCP slow start: each time the reader consumes a full
-					// window and had to wait for data along the way, double the window (up to the
-					// max). Waiting means delivery, possibly the window, is the bottleneck; a
-					// reader that always finds data is the bottleneck itself, and a bigger window
-					// would only pile up unread data. Streams being read on fast, high-latency
+					// window, double the window (up to the max). Past UNCONDITIONAL_GROWTH_LIMIT the
+					// reader must also have had to wait for data along the way: waiting means
+					// delivery, possibly the window, is the bottleneck, while a reader that always
+					// finds data is the bottleneck itself, and a bigger window would only pile up
+					// unread data. Streams being read on fast, high-latency
 					// links reach a large window within a few round trips; a stream nobody reads
 					// never grows. The connection budget limits growth across all streams.
 					if state.rx_since_growth >= state.rx_window
-						&& state.rx_starved
+						&& (state.rx_starved || state.rx_window < UNCONDITIONAL_GROWTH_LIMIT)
 						&& state.rx_window < self.params.rx_max_window
 					{
 						let extra = state.rx_window.min(self.params.rx_max_window - state.rx_window);

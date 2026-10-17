@@ -22,6 +22,15 @@ struct Counters {
 	bytes: AtomicU64,
 }
 
+/// `WINDOW=<bytes>` sets the initial WispX window.
+fn x_options() -> WispXOptions {
+	let mut options = WispXOptions::new(vec![]);
+	if let Some(window) = std::env::var("WINDOW").ok().and_then(|x| x.parse().ok()) {
+		options.stream_window = window;
+	}
+	options
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
 	let args: Vec<String> = std::env::args().collect();
@@ -49,7 +58,7 @@ async fn main() {
 
 	let server = tokio::spawn(async move {
 		let result = if x {
-			ServerMux::new_wispx(srx, stx, WispXOptions::new(vec![])).await
+			ServerMux::new_wispx(srx, stx, x_options()).await
 		} else {
 			ServerMux::new(srx, stx, 128, Some(WispV2Handshake::new(vec![]))).await
 		};
@@ -65,7 +74,7 @@ async fn main() {
 	});
 
 	let result = if x {
-		ClientMux::new_wispx(crx, ctx, WispXOptions::new(vec![])).await
+		ClientMux::new_wispx(crx, ctx, x_options()).await
 	} else {
 		ClientMux::new(crx, ctx, Some(WispV2Handshake::new(vec![]))).await
 	};
