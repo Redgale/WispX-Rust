@@ -1,0 +1,71 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Wisp browser test</title>
+<pre id="log"></pre>
+<script type="module">
+// count websocket traffic in both directions
+window.wsStats = { sent: 0, sentBytes: 0, received: 0 };
+const origSend = WebSocket.prototype.send;
+window.frameLog = { sent: {}, received: {} };
+// WispX: list the frame types in a message, e.g. "1,2" for CONNECT+DATA
+const frameTypes = (buf) => {
+	const v = new DataView(buf instanceof ArrayBuffer ? buf : buf.buffer, buf.byteOffset || 0, buf.byteLength);
+	const types = [];
+	for (let off = 0; off + 9 <= v.byteLength && types.length < 8; off += 9 + v.getUint32(off + 5, true)) types.push(v.getUint8(off));
+	return types.join(",");
+};
+const note = (map, key) => { map[key] = (map[key] || 0) + 1; };
+WebSocket.prototype.send = function (data) {
+	if (window.logFrames) note(frameLog.sent, frameTypes(data));
+	wsStats.sent++;
+	wsStats.sentBytes += data.byteLength ?? data.length ?? 0;
+	if (!this.__counted) {
+		this.__counted = true;
+		this.addEventListener("message", (e) => {
+			wsStats.received++;
+			if (window.logFrames && e.data instanceof ArrayBuffer) note(frameLog.received, frameTypes(e.data));
+		});
+	}
+	return origSend.call(this, data);
+};
+const log = (x) => { document.getElementById("log").textContent += x + "\n"; console.log(x); };
+
+// runTest({ lib, wisp, v2, wispx, total, concurrency, size })
+window.runTest = async ({ lib = "epoxy-orig", wisp, v2 = false, wispx = false, total = 500, concurrency = 32, size = 16384, origin = "http://127.0.0.1:8090/" }) => {
+	const m = await import(`./${lib}/full/epoxy-bundled.js`);
+	window.inited = window.inited || {};
+	if (!window.inited[lib]) { await m.default(); window.inited[lib] = true; }
+	const options = new m.EpoxyClientOptions();
+	options.wisp_v2 = v2;
+	if ("wispx" in options) options.wispx = wispx;
+	options.disable_certificate_validation = true;
+	const client = new m.EpoxyClient(wisp, options);
+	let ok = 0, truncated = 0, errors = 0, next = 0;
+	const before = { ...wsStats };
+	const lengths = {};
+	const start = performance.now();
+	const worker = async () => {
+		while (next < total) {
+			next++;
+			try {
+				// same option shape epoxy-transport (Scramjet) passes
+				const res = await client.fetch(`${origin}?n=${size}`, { method: "GET", body: null, headers: {}, redirect: "manual" });
+				const body = await res.arrayBuffer();
+				if (body.byteLength === size) ok++;
+				else { truncated++; lengths[body.byteLength] = (lengths[body.byteLength] || 0) + 1; }
+			} catch (e) {
+				errors++;
+				if (errors < 3) log("error: " + e);
+			}
+		}
+	};
+	await Promise.all(Array.from({ length: concurrency }, worker));
+	const secs = (performance.now() - start) / 1000;
+	const result = { lib, wisp, v2, wispx, size, origin, total, ok, truncated, errors, per_sec: Math.round(total / secs), lengths,
+		ws_sends_per_req: +((wsStats.sent - before.sent) / total).toFixed(2),
+		ws_msgs_received_per_req: +((wsStats.received - before.received) / total).toFixed(2) };
+	log(JSON.stringify(result));
+	return result;
+};
+log("ready, crossOriginIsolated=" + crossOriginIsolated);
+</script>

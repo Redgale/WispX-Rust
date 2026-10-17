@@ -31,8 +31,9 @@ pub type LockedWebSocketWriteGuard<W> = futures::lock::OwnedMutexGuard<W>;
 /// Default initial per-stream receive window for WispX connections.
 pub const DEFAULT_WISPX_STREAM_WINDOW: u32 = 256 * 1024;
 /// Default maximum per-stream receive window for WispX connections. Windows grow up to this
-/// while the stream's reader keeps up. 64 MiB keeps a single stream above 1 GiB/s at 50 ms RTT.
-pub const DEFAULT_WISPX_MAX_STREAM_WINDOW: u32 = 64 * 1024 * 1024;
+/// while the stream's reader keeps waiting for data. The connection limit below is the real
+/// bound on unread data; this only stops a single stream from taking all of it.
+pub const DEFAULT_WISPX_MAX_STREAM_WINDOW: u32 = 256 * 1024 * 1024;
 /// Default limit on window growth across all streams of one WispX connection, which bounds how
 /// much unread data a peer can make us hold.
 pub const DEFAULT_WISPX_MAX_CONNECTION_WINDOW: u64 = 256 * 1024 * 1024;

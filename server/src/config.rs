@@ -391,7 +391,7 @@ impl Default for WispConfig {
 			wisp_v2: true,
 			wispx: true,
 			wispx_stream_window: 256 * 1024,
-			wispx_max_stream_window: 64 * 1024 * 1024,
+			wispx_max_stream_window: 256 * 1024 * 1024,
 			wispx_max_connection_window: 256 * 1024 * 1024,
 			v2_close_delay_ms: 2,
 			extensions: vec![ProtocolExtension::Udp, ProtocolExtension::Motd],

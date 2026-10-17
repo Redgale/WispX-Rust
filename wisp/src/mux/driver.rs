@@ -33,7 +33,8 @@ const MAX_BYTES_PER_FLUSH: usize = 1024 * 1024;
 /// The read and write loops share one task. Without this, a constantly readable transport keeps
 /// the read loop busy until the runtime's budget runs out, and the frames it queues (credit
 /// updates, replies) wait behind megabytes of reading. The write loop doesn't need it: it
-/// returns `Pending` whenever the queue drains or the transport is full.
+/// returns `Pending` whenever the queue drains or the transport is full. (Yielding in the write
+/// loop to collect bigger batches was measured: it costs 5-10% on request/response traffic.)
 async fn yield_now() {
 	let mut yielded = false;
 	poll_fn(|cx| {

@@ -101,6 +101,8 @@ pub(crate) struct StreamState {
 	rx_window: u64,
 	/// WispX: bytes consumed since the window last grew.
 	rx_since_growth: u64,
+	/// WispX: the reader found nothing to read and had to wait, since the window last grew.
+	rx_starved: bool,
 	/// WispX: how much this stream's window has grown, counted against the connection budget.
 	rx_grown: u64,
 
@@ -162,6 +164,8 @@ enum OutState {
 
 struct OutQueue {
 	frames: VecDeque<OutFrame>,
+	/// Unannounced client streams whose reader is waiting; the writer announces them.
+	announce: Vec<Arc<StreamShared>>,
 	bytes: usize,
 	writer: Option<Waker>,
 	blocked: Vec<Waker>,
@@ -204,6 +208,7 @@ impl MuxShared {
 			streams: Mutex::new(StreamMap::default()),
 			out: Mutex::new(OutQueue {
 				frames: VecDeque::new(),
+				announce: Vec::new(),
 				bytes: 0,
 				writer: None,
 				blocked: Vec::new(),
@@ -299,6 +304,18 @@ impl MuxShared {
 		blocked: &mut Vec<Waker>,
 	) -> Poll<WriterEvent> {
 		let mut out = lock(&self.out);
+		if !out.announce.is_empty() {
+			let announce = mem::take(&mut out.announce);
+			drop(out);
+			// announcing locks each stream, which can't happen under the queue lock
+			for stream in announce {
+				let mut state = stream.lock();
+				if state.pending_connect.is_some() && state.closed.is_none() {
+					let _ = self.push_opening(&stream, &mut state, |_| [None, None]);
+				}
+			}
+			out = lock(&self.out);
+		}
 		if !out.frames.is_empty() {
 			mem::swap(&mut out.frames, buf);
 			out.bytes = 0;
@@ -356,16 +373,24 @@ impl MuxShared {
 	pub fn shutdown(&self) {
 		self.dead.store(true, Ordering::Release);
 
-		let wakers = {
+		let (wakers, unannounced) = {
 			let mut out = lock(&self.out);
 			out.state = OutState::Dead;
 			out.frames.clear();
 			out.bytes = 0;
 			let mut wakers = mem::take(&mut out.blocked);
 			wakers.extend(out.writer.take());
-			wakers
+			(wakers, mem::take(&mut out.announce))
 		};
 		wakers.into_iter().for_each(Waker::wake);
+		for stream in unannounced {
+			let wakers = {
+				let mut state = stream.lock();
+				state.closed.get_or_insert(CloseReason::Unknown);
+				state.take_all_wakers()
+			};
+			wakers.into_iter().for_each(Waker::wake);
+		}
 
 		lock(&self.new_streams).take();
 
@@ -415,6 +440,7 @@ impl MuxShared {
 				rx_peer_credit,
 				rx_window: self.params.rx_window,
 				rx_since_growth: 0,
+				rx_starved: false,
 				rx_grown: 0,
 				tx_credit,
 				tx_waker: None,
@@ -564,11 +590,33 @@ impl MuxShared {
 		cx: &mut Context<'_>,
 	) -> Poll<Option<Bytes>> {
 		let mut state = stream.lock();
-		if state.pending_connect.is_some()
-			&& self.push_opening(stream, &mut state, |_| [None, None]).is_err()
-		{
-			// the reader is waiting for the peer, so the stream has to exist now
-			return Poll::Ready(None);
+		if state.pending_connect.is_some() {
+			// The reader is waiting for the peer, so the stream must be announced, but not
+			// necessarily right now: hand it to the writer, which runs after whatever else is
+			// ready. Readers usually write right after their first read (hyper polls read, then
+			// write), and then the CONNECT goes out with that data.
+			if state.closed.is_some() {
+				return Poll::Ready(None);
+			}
+			match &mut state.rx_waker {
+				Some(waker) => waker.clone_from(cx.waker()),
+				None => state.rx_waker = Some(cx.waker().clone()),
+			}
+			drop(state);
+			let waker = {
+				let mut out = lock(&self.out);
+				if !matches!(out.state, OutState::Open) {
+					return Poll::Ready(None);
+				}
+				if !out.announce.iter().any(|x| Arc::ptr_eq(x, stream)) {
+					out.announce.push(stream.clone());
+				}
+				out.writer.take()
+			};
+			if let Some(waker) = waker {
+				waker.wake();
+			}
+			return Poll::Pending;
 		}
 		if let Some(chunk) = state.rx.pop_front() {
 			state.rx_bytes -= chunk.len();
@@ -589,6 +637,7 @@ impl MuxShared {
 		} else if state.rx_eof || state.closed.is_some() {
 			Poll::Ready(None)
 		} else {
+			state.rx_starved = true;
 			match &mut state.rx_waker {
 				Some(waker) => waker.clone_from(cx.waker()),
 				None => state.rx_waker = Some(cx.waker().clone()),
@@ -617,13 +666,15 @@ impl MuxShared {
 				if state.rx_unacked >= (state.rx_window / 4).max(1) {
 					let mut increment = state.rx_unacked;
 					state.rx_unacked = 0;
-					// Window auto-tuning, like TCP slow start: every time the reader consumes a
-					// full window, double it (up to the max). Streams that are being read reach a
-					// window big enough for fast, high-latency links within a few round trips,
-					// and credit updates get rarer as the window grows. A stream nobody reads
-					// never grows, so unread data stays bounded by the initial window.
-					// The connection budget stops one connection from growing many windows at once.
+					// Window auto-tuning, like TCP slow start: each time the reader consumes a full
+					// window and had to wait for data along the way, double the window (up to the
+					// max). Waiting means delivery, possibly the window, is the bottleneck; a
+					// reader that always finds data is the bottleneck itself, and a bigger window
+					// would only pile up unread data. Streams being read on fast, high-latency
+					// links reach a large window within a few round trips; a stream nobody reads
+					// never grows. The connection budget limits growth across all streams.
 					if state.rx_since_growth >= state.rx_window
+						&& state.rx_starved
 						&& state.rx_window < self.params.rx_max_window
 					{
 						let extra = state.rx_window.min(self.params.rx_max_window - state.rx_window);
@@ -633,6 +684,7 @@ impl MuxShared {
 							increment += extra;
 						}
 						state.rx_since_growth = 0;
+						state.rx_starved = false;
 					}
 					#[expect(clippy::cast_possible_wrap)]
 					{

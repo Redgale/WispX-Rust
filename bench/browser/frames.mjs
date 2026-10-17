@@ -1,0 +1,11 @@
+import puppeteer from "puppeteer-core";
+const config = JSON.parse(process.argv[2]);
+const browser = await puppeteer.launch({ executablePath: process.env.CHROME, headless: true, args: ["--no-sandbox"] });
+const page = await browser.newPage();
+await page.goto("http://127.0.0.1:8091/");
+await page.waitForFunction(() => typeof window.runTest === "function");
+await page.evaluate((c) => window.runTest({ ...c, total: 50 }), config);
+await page.evaluate(() => { window.logFrames = true; window.frameLog = { sent: {}, received: {} }; });
+const r = await page.evaluate((c) => window.runTest(c), config);
+console.log(JSON.stringify({ per_sec: r.per_sec, frames: await page.evaluate(() => window.frameLog) }, null, 1));
+await browser.close();

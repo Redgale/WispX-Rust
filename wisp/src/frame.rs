@@ -35,8 +35,8 @@ pub const WISPX_MIN_MESSAGE_SIZE: u32 = 64 * 1024;
 /// [`MuxStreamWrite::send_with_headroom`]: crate::stream::MuxStreamWrite::send_with_headroom
 pub const DATA_HEADROOM: usize = X_HEADER_LEN;
 
-/// Frames at least this big that have headroom are sent as their own message without copying.
-/// Smaller ones are copied into the current batch, which is cheaper than an extra message.
+/// v1/v2 frames at least this big that have headroom are sent without copying. (Every v1/v2
+/// frame is its own message anyway.)
 const ZERO_COPY_MIN: usize = 2048;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -178,8 +178,15 @@ impl OutFrame {
 		bytes
 	}
 
-	fn is_zero_copy(&self) -> bool {
-		matches!(&self.payload, OutPayload::Headroom(x) if x.len() - DATA_HEADROOM >= ZERO_COPY_MIN)
+	/// Whether to send this frame alone, without copying. For WispX only frames of at least half
+	/// a batch qualify: copying smaller ones into a shared message is cheaper than the extra
+	/// message (measured: zero-copying 16 KiB writes cost a third of upload throughput).
+	fn is_zero_copy(&self, proto: Proto, batch_size: usize) -> bool {
+		let min = match proto {
+			Proto::V1 | Proto::V2 => ZERO_COPY_MIN,
+			Proto::X => batch_size / 2,
+		};
+		matches!(&self.payload, OutPayload::Headroom(x) if x.len() - DATA_HEADROOM >= min)
 	}
 
 	/// Encode this frame as a standalone websocket message.
@@ -213,13 +220,13 @@ pub(crate) fn encode_batch(
 	let header = proto.header_len();
 	let total: usize = frames
 		.iter()
-		.filter(|x| !x.is_zero_copy())
+		.filter(|x| !x.is_zero_copy(proto, batch_size))
 		.map(|x| header + x.payload_len())
 		.sum();
 	let mut buf = BytesMut::with_capacity(total);
 
 	for frame in frames.drain(..) {
-		if frame.is_zero_copy() {
+		if frame.is_zero_copy(proto, batch_size) {
 			// keep message order: whatever is batched so far goes first
 			if !buf.is_empty() {
 				out.push(buf.split().freeze());
@@ -390,7 +397,7 @@ mod tests {
 	#[test]
 	fn headroom_frames_are_not_copied() {
 		for proto in [Proto::X, Proto::V2] {
-			let big = vec![7u8; 10_000];
+			let big = vec![7u8; 40_000];
 			let buf = headroom(&big);
 			let payload_ptr = buf[DATA_HEADROOM..].as_ptr();
 			let mut frames: VecDeque<_> = vec![
@@ -414,7 +421,7 @@ mod tests {
 			}
 			assert_eq!(decoded.len(), 3);
 			assert_eq!(decoded[0].ty, TY_CONTINUE);
-			assert_eq!((decoded[1].id, decoded[1].payload.len()), (2, 10_000));
+			assert_eq!((decoded[1].id, decoded[1].payload.len()), (2, 40_000));
 			assert_eq!(&decoded[2].payload[..], b"small");
 		}
 	}

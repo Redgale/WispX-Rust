@@ -99,6 +99,9 @@ struct Cli {
 	/// WispX client: per-stream receive window in bytes.
 	#[arg(long, default_value_t = wisp_mux::DEFAULT_WISPX_STREAM_WINDOW)]
 	window: u32,
+	/// WispX client: largest per-stream receive window in bytes.
+	#[arg(long, default_value_t = wisp_mux::DEFAULT_WISPX_MAX_STREAM_WINDOW)]
+	max_window: u32,
 }
 
 trait Rw: AsyncRead + AsyncWrite + Send {}
@@ -118,7 +121,7 @@ impl Client {
 	}
 }
 
-async fn connect(url: &Uri, kind: ClientKind, window: u32) -> Result<Client> {
+async fn connect(url: &Uri, kind: ClientKind, window: u32, max_window: u32) -> Result<Client> {
 	let host = url.host().context("no host in url")?;
 	let port = url.port_u16().unwrap_or(80);
 	let tcp = TcpStream::connect((host, port)).await?;
@@ -175,6 +178,7 @@ async fn connect(url: &Uri, kind: ClientKind, window: u32) -> Result<Client> {
 				ClientKind::X => {
 					let mut options = WispXOptions::new(vec![]);
 					options.stream_window = window;
+					options.max_stream_window = max_window;
 					ClientMux::new_wispx(rx, tx, options).await?
 				}
 				ClientKind::V2 => ClientMux::new(rx, tx, Some(WispV2Handshake::new(vec![]))).await?,
@@ -426,7 +430,7 @@ async fn run_ttfb(cli: &Cli, url: &Uri, report: &mut Report) -> Result<()> {
 
 	for _ in 0..cli.iterations {
 		let start = Instant::now();
-		let client = connect_client(url, cli.client, cli.window).await?;
+		let client = connect_client(url, cli.client, cli.window, cli.max_window).await?;
 		let connected = Instant::now();
 		let mut stream = client.open(target).await?;
 		stream.write_all(&request).await?;
@@ -453,8 +457,10 @@ async fn run_ttfb(cli: &Cli, url: &Uri, report: &mut Report) -> Result<()> {
 	Ok(())
 }
 
-async fn connect_client(url: &Uri, kind: ClientKind, window: u32) -> Result<Client> {
-	connect(url, kind, window).await.context("failed to connect")
+async fn connect_client(url: &Uri, kind: ClientKind, window: u32, max_window: u32) -> Result<Client> {
+	connect(url, kind, window, max_window)
+		.await
+		.context("failed to connect")
 }
 
 async fn run_load(cli: &Cli, url: &Uri, report: &mut Report) -> Result<()> {
@@ -478,7 +484,7 @@ async fn run_load(cli: &Cli, url: &Uri, report: &mut Report) -> Result<()> {
 
 	let mut tasks = Vec::new();
 	for _ in 0..cli.connections {
-		let client = Arc::new(connect_client(url, cli.client, cli.window).await?);
+		let client = Arc::new(connect_client(url, cli.client, cli.window, cli.max_window).await?);
 		report.protocol.clone_from(&client.protocol);
 		for _ in 0..cli.streams {
 			let client = client.clone();
