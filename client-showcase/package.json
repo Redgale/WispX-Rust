@@ -1,0 +1,21 @@
+{
+	"name": "client-showcase",
+	"private": true,
+	"version": "0.0.0",
+	"type": "module",
+	"packageManager": "pnpm@10.27.0",
+	"scripts": {
+		"dev": "vite",
+		"build": "tsc && vite build",
+		"preview": "vite preview"
+	},
+	"devDependencies": {
+		"typescript": "~5.9.3",
+		"vite": "^7.3.1",
+		"vite-plugin-static-copy": "^3.1.4"
+	},
+	"dependencies": {
+		"@mercuryworkshop/epoxy-tls": "link:../client",
+		"dreamland": "^0.1.3"
+	}
+}
