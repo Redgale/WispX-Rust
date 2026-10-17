@@ -178,6 +178,13 @@ pub struct WispConfig {
 	/// WispX: a stream's window grows up to this while the destination keeps up with the
 	/// client's uploads.
 	pub wispx_max_stream_window: u32,
+	/// Wisp v1/v2: after a destination closes its side, wait this long before sending CLOSE.
+	///
+	/// v1/v2 have no half-close, so a finished response is followed by a CLOSE. The original
+	/// wisp-mux client (epoxy-tls 2.x) discards received data it hasn't read yet when a CLOSE
+	/// arrives, which truncates responses whose last data and CLOSE arrive together. A short
+	/// delay lets clients read the data first. WispX uses FIN instead and isn't affected.
+	pub v2_close_delay_ms: u64,
 	/// Wisp version 2 extensions advertised.
 	pub extensions: Vec<ProtocolExtension>,
 	/// Wisp version 2 authentication extension advertised.
@@ -377,6 +384,7 @@ impl Default for WispConfig {
 			wispx: true,
 			wispx_stream_window: 256 * 1024,
 			wispx_max_stream_window: 16 * 1024 * 1024,
+			v2_close_delay_ms: 20,
 			extensions: vec![ProtocolExtension::Udp, ProtocolExtension::Motd],
 			auth_extension: None,
 

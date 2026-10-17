@@ -153,6 +153,38 @@ async fn async_init() {
 	#[cfg(feature = "tokio-console")]
 	console_subscriber::init();
 
+	#[cfg(feature = "profile")]
+	if let Some(secs) = std::env::var("EPOXY_PROFILE")
+		.ok()
+		.and_then(|x| x.parse::<u64>().ok())
+	{
+		std::thread::spawn(move || {
+			let guard = pprof::ProfilerGuardBuilder::default()
+				.frequency(999)
+				.blocklist(&["libc", "libgcc", "pthread", "vdso"])
+				.build()
+				.expect("failed to start profiler");
+			std::thread::sleep(std::time::Duration::from_secs(secs));
+			if let Ok(report) = guard.report().build() {
+				use std::fmt::Write;
+				let mut folded = String::new();
+				for (frames, count) in &report.data {
+					let stack: Vec<String> = frames
+						.frames
+						.iter()
+						.rev()
+						.flat_map(|x| x.iter().rev().map(|s| s.name()))
+						.collect();
+					let _ = writeln!(folded, "{};{} {count}", frames.thread_name, stack.join(";"));
+				}
+				let _ = std::fs::write("profile.folded", folded);
+				let file = std::fs::File::create("flamegraph.svg").unwrap();
+				report.flamegraph(file).unwrap();
+				info!("wrote flamegraph.svg and profile.folded");
+			}
+		});
+	}
+
 	validate_config_cache().await;
 
 	info!(

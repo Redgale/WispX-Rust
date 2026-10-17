@@ -34,6 +34,10 @@ await init({ module_or_path: "path/to/epoxy.wasm" });
 const options = new EpoxyClientOptions();
 options.user_agent = navigator.userAgent;
 options.wisp_v2 = true;
+// WispX (see protocolX.md): faster, and falls back to v2/v1 by itself on servers without it.
+// Only turn this on for servers that answer the websocket subprotocol they're offered
+// (epoxy-server does), otherwise the browser rejects the websocket.
+options.wispx = true;
 options.udp_extension_required = true;
 
 // use your own selfhosted wisp server, this is the demo one with throttling

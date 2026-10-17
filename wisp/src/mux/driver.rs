@@ -183,7 +183,13 @@ async fn handle_frame<R: TransportRead>(
 	let proto = shared.params.proto;
 
 	match ty {
-		TY_DATA => shared.on_data(id, payload),
+		TY_DATA => {
+			if let Some(stream) = shared.on_data(id, payload) {
+				// a v1/v2 client is sending faster than the stream is read: stop reading the
+				// connection (TCP backpressure) until it catches up
+				poll_fn(|cx| shared.poll_drained(&stream, cx)).await;
+			}
+		}
 		TY_CONTINUE => {
 			if payload.len() >= 4 {
 				shared.on_credit(id, payload.get_u32_le());

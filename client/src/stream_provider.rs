@@ -20,7 +20,7 @@ use wisp_mux::{
 	packet::StreamType,
 	stream::{MuxStream, MuxStreamAsyncRW},
 	ws::{TransportRead, TransportWrite},
-	ClientMux, WispV2Handshake,
+	ClientMux, WispV2Handshake, WispXOptions,
 };
 
 use crate::{
@@ -56,6 +56,7 @@ pub struct StreamProvider {
 	wisp_generator: ProviderWispTransportGenerator,
 
 	wisp_v2: bool,
+	wispx: bool,
 	udp_extension: bool,
 
 	current_client: Arc<Mutex<Option<ClientMux<ProviderWispTransportWrite>>>>,
@@ -109,6 +110,7 @@ impl StreamProvider {
 			wisp_generator,
 			current_client: Arc::new(Mutex::new(None)),
 			wisp_v2: options.wisp_v2,
+			wispx: options.wispx,
 			udp_extension: options.udp_extension_required,
 			h2_config: client_config,
 			client_config: no_alpn_client_config,
@@ -123,15 +125,16 @@ impl StreamProvider {
 			vec![AnyProtocolExtensionBuilder::new(
 				UdpProtocolExtensionBuilder,
 			)];
-		let extensions = if self.wisp_v2 {
-			Some(WispV2Handshake::new(extensions_vec))
+		// a WispX client needs the same kind of transport as a v2 one
+		let (read, write) = (self.wisp_generator)(self.wisp_v2 || self.wispx).await?;
+
+		let client = if self.wispx {
+			ClientMux::new_wispx(read, write, WispXOptions::new(extensions_vec)).await?
+		} else if self.wisp_v2 {
+			ClientMux::new(read, write, Some(WispV2Handshake::new(extensions_vec))).await?
 		} else {
-			None
+			ClientMux::new(read, write, None).await?
 		};
-
-		let (read, write) = (self.wisp_generator)(self.wisp_v2).await?;
-
-		let client = ClientMux::new(read, write, extensions).await?;
 		let (mux, fut) = if self.udp_extension {
 			client.with_udp_extension_required().await?
 		} else {

@@ -23,6 +23,10 @@ use crate::{
 
 /// Credit value meaning "not flow controlled".
 pub(crate) const UNLIMITED: u64 = u64::MAX;
+/// v1/v2 server: once a stream has this much unread data, stop reading the connection until it
+/// drains. v1/v2 clients ignore CONTINUE, so this (TCP backpressure) is the only way to bound
+/// memory without dropping data, which is what the reference server does.
+const V2_PAUSE_BYTES: usize = 4 * 1024 * 1024;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 	// a panic while holding one of these locks leaves the state consistent enough to keep going
@@ -67,9 +71,15 @@ impl MuxParams {
 		self.proto == Proto::X || self.role == Role::Server
 	}
 
-	/// Whether the peer gives us flow control credit for streams we send on.
+	/// Whether we wait for the peer's flow control credit before sending.
+	///
+	/// Only WispX. In v1/v2, deployed clients don't honor CONTINUE (wisp-mux 6's `AsyncWrite`,
+	/// which epoxy uses for every TLS connection, never checks it) and the reference server
+	/// relies on that: it queues CONTINUE packets without flushing them, so a client that waits
+	/// for them stalls until something else flushes the websocket. A v1/v2 server instead pushes
+	/// back by pausing reads, see [`MuxShared::on_data`].
 	fn tracks_credit(&self) -> bool {
-		self.proto == Proto::X || self.role == Role::Client
+		self.proto == Proto::X
 	}
 }
 
@@ -95,6 +105,8 @@ pub(crate) struct StreamState {
 
 	pub closed: Option<CloseReason>,
 	close_wakers: Vec<Waker>,
+	/// v1/v2 server: the read loop, waiting for this stream to drain.
+	drain_waker: Option<Waker>,
 	/// Removed from the stream map.
 	removed: bool,
 }
@@ -108,6 +120,7 @@ impl StreamState {
 		let mut wakers = mem::take(&mut self.close_wakers);
 		wakers.extend(self.rx_waker.take());
 		wakers.extend(self.tx_waker.take());
+		wakers.extend(self.drain_waker.take());
 		wakers
 	}
 }
@@ -377,6 +390,7 @@ impl MuxShared {
 				tx_fin: false,
 				closed: None,
 				close_wakers: Vec::new(),
+				drain_waker: None,
 				removed: false,
 			}),
 		})
@@ -457,9 +471,17 @@ impl MuxShared {
 		if let Some(chunk) = state.rx.pop_front() {
 			state.rx_bytes -= chunk.len();
 			let credit = self.account_consumed(stream, &mut state, chunk.len());
+			let drained = if state.rx_bytes < V2_PAUSE_BYTES {
+				state.drain_waker.take()
+			} else {
+				None
+			};
 			drop(state);
 			if let Some(frame) = credit {
 				let _ = self.enqueue(frame);
+			}
+			if let Some(waker) = drained {
+				waker.wake();
 			}
 			Poll::Ready(Some(chunk))
 		} else if state.rx_eof || state.closed.is_some() {
@@ -681,44 +703,47 @@ impl MuxShared {
 
 	// ---- events from the peer ----
 
-	/// DATA arrived. A peer that overruns its flow control credit gets the stream closed with
-	/// [`CloseReason::ProtocolViolation`]; data is never silently dropped from an open stream.
-	pub fn on_data(&self, id: u32, data: Bytes) {
-		let Some(stream) = self.get_stream(id) else {
-			return;
-		};
-		let waker = {
+	/// DATA arrived.
+	///
+	/// A WispX peer that overruns its credit gets the stream closed with
+	/// [`CloseReason::ProtocolViolation`]. For v1/v2, returns the stream if the read loop should
+	/// wait for it to drain (see [`V2_PAUSE_BYTES`]). Data is never dropped from an open stream.
+	pub fn on_data(&self, id: u32, data: Bytes) -> Option<Arc<StreamShared>> {
+		let stream = self.get_stream(id)?;
+		let (waker, pause) = {
 			let mut state = stream.lock();
 			if state.closed.is_some() || state.rx_eof {
-				return;
+				return None;
 			}
-			let violation = stream.flow
-				&& self.params.grants_credit()
-				&& match self.params.proto {
-					Proto::X => {
-						state.rx_peer_credit -= data.len() as i64;
-						state.rx_peer_credit < 0
-					}
-					// v1/v2 CONTINUE values are absolute and race with packets in flight, so
-					// clients get generous slack before this counts as abuse
-					Proto::V1 | Proto::V2 => {
-						state.rx.len() as u64 >= (self.params.rx_window * 4).max(1024)
-					}
-				};
-			if violation {
-				None
-			} else {
-				state.rx_bytes += data.len();
-				state.rx.push_back(data);
-				Some(state.rx_waker.take())
+			if stream.flow && self.params.grants_credit() && self.params.proto == Proto::X {
+				state.rx_peer_credit -= data.len() as i64;
+				if state.rx_peer_credit < 0 {
+					drop(state);
+					let _ = self.close_stream(&stream, CloseReason::ProtocolViolation);
+					return None;
+				}
 			}
+			state.rx_bytes += data.len();
+			state.rx.push_back(data);
+			let pause = self.params.proto != Proto::X
+				&& self.params.role == Role::Server
+				&& state.rx_bytes >= V2_PAUSE_BYTES;
+			(state.rx_waker.take(), pause)
 		};
-		match waker {
-			Some(Some(waker)) => waker.wake(),
-			Some(None) => {}
-			None => {
-				let _ = self.close_stream(&stream, CloseReason::ProtocolViolation);
-			}
+		if let Some(waker) = waker {
+			waker.wake();
+		}
+		pause.then_some(stream)
+	}
+
+	/// Resolves once `stream` has drained below [`V2_PAUSE_BYTES`] or closed.
+	pub fn poll_drained(&self, stream: &StreamShared, cx: &mut Context<'_>) -> Poll<()> {
+		let mut state = stream.lock();
+		if state.rx_bytes < V2_PAUSE_BYTES || state.closed.is_some() {
+			Poll::Ready(())
+		} else {
+			state.drain_waker = Some(cx.waker().clone());
+			Poll::Pending
 		}
 	}
 

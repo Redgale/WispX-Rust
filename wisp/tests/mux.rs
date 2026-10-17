@@ -758,3 +758,43 @@ async fn mt_concurrent_open_x() {
 		task.await.unwrap();
 	}
 }
+
+/// v1/v2 clients don't wait for CONTINUE. A server stream that is read slowly must push back
+/// (by pausing the connection) instead of dropping data or resetting the stream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn v2_slow_reader_gets_all_data() {
+	const TOTAL: usize = 24 * 1024 * 1024;
+	let (client, server) = connect(Mode::V2, Mode::V2, 0).await;
+
+	let reader = tokio::spawn(async move {
+		let (_, mut stream) = server.wait_for_stream().await.unwrap();
+		let mut received = BytesMut::new();
+		while received.len() < TOTAL {
+			let chunk = timeout(Duration::from_secs(10), stream.next())
+				.await
+				.expect("stalled")
+				.expect("stream ended early")
+				.unwrap();
+			received.extend_from_slice(&chunk);
+			// a slow destination
+			if received.len() % (1024 * 1024) < chunk.len() {
+				sleep(Duration::from_millis(20)).await;
+			}
+		}
+		assert_eq!(stream.get_close_reason(), None);
+		(received.freeze(), server)
+	});
+
+	let expected = pattern(TOTAL, 9);
+	let mut stream = client
+		.new_stream(StreamType::Tcp, "a".into(), 1)
+		.await
+		.unwrap();
+	let mut data = expected.clone();
+	while !data.is_empty() {
+		let len = data.len().min(16 * 1024);
+		stream.send(data.split_to(len)).await.unwrap();
+	}
+	let (received, _server) = reader.await.unwrap();
+	assert!(received == expected, "data was corrupted");
+}

@@ -222,11 +222,16 @@ async fn target_source() -> Result<SocketAddr> {
 	.await
 }
 
+/// Bytes that actually arrived at the upload target, as opposed to bytes the client wrote.
+static SINK_RECEIVED: AtomicU64 = AtomicU64::new(0);
+
 async fn target_sink() -> Result<SocketAddr> {
 	listen(|mut stream| {
 		tokio::spawn(async move {
 			let mut buf = vec![0u8; 64 * 1024];
-			while matches!(stream.read(&mut buf).await, Ok(n) if n > 0) {}
+			while let Ok(n @ 1..) = stream.read(&mut buf).await {
+				SINK_RECEIVED.fetch_add(n as u64, Ordering::Relaxed);
+			}
 		});
 	})
 	.await
@@ -242,8 +247,9 @@ async fn target_echo() -> Result<SocketAddr> {
 	.await
 }
 
-/// Reads `req` bytes, writes `resp` bytes, closes.
-async fn target_http(req: usize, resp: usize) -> Result<SocketAddr> {
+/// Reads `req` bytes, writes `resp` bytes, then closes (or, with `keep_open`, waits for the
+/// client to close).
+async fn target_http(req: usize, resp: usize, keep_open: bool) -> Result<SocketAddr> {
 	let response = Bytes::from(vec![b'x'; resp]);
 	listen(move |mut stream| {
 		let response = response.clone();
@@ -251,6 +257,9 @@ async fn target_http(req: usize, resp: usize) -> Result<SocketAddr> {
 			let mut buf = vec![0u8; req.max(1)];
 			if stream.read_exact(&mut buf[..req]).await.is_ok() {
 				let _ = stream.write_all(&response).await;
+			}
+			if keep_open {
+				while matches!(stream.read(&mut buf).await, Ok(n) if n > 0) {}
 			}
 			let _ = stream.shutdown().await;
 		});
@@ -332,8 +341,10 @@ struct Report {
 	resp_size: usize,
 	delay_ms: u64,
 	seconds: f64,
-	/// download/upload
+	/// download/upload; for upload, measured where the data arrives
 	mib_per_sec: Option<f64>,
+	/// upload: what the client wrote, which exceeds `mib_per_sec` if data was lost
+	upload_written_mib_per_sec: Option<f64>,
 	/// rr round trips/s, churn streams/s
 	ops_per_sec: Option<f64>,
 	p50_ms: Option<f64>,
@@ -348,6 +359,8 @@ struct Report {
 	/// Server CPU per unit of work: per GiB moved, or per 1000 operations.
 	server_cpu_ms_per_unit: Option<f64>,
 	errors: u64,
+	/// churn: responses that ended before all their data arrived
+	truncated: u64,
 }
 
 struct Shared {
@@ -356,6 +369,8 @@ struct Shared {
 	bytes: AtomicU64,
 	ops: AtomicU64,
 	errors: AtomicU64,
+	/// churn: responses that ended early
+	truncated: AtomicU64,
 	latencies: Mutex<Vec<u64>>,
 }
 
@@ -400,7 +415,8 @@ async fn main() -> Result<()> {
 }
 
 async fn run_ttfb(cli: &Cli, url: &Uri, report: &mut Report) -> Result<()> {
-	let target = target_http(cli.size, cli.resp_size).await?;
+	// keep the target open: the original client loses data that arrives together with a CLOSE
+	let target = target_http(cli.size, cli.resp_size, true).await?;
 	let request = vec![b'r'; cli.size];
 	let (mut connect, mut first, mut total) = (Vec::new(), Vec::new(), Vec::new());
 	let cpu_before = cli.server_pid.and_then(process_cpu_seconds);
@@ -443,7 +459,7 @@ async fn run_load(cli: &Cli, url: &Uri, report: &mut Report) -> Result<()> {
 		Workload::Download => target_source().await?,
 		Workload::Upload => target_sink().await?,
 		Workload::Rr => target_echo().await?,
-		Workload::Churn => target_http(cli.size, cli.resp_size).await?,
+		Workload::Churn => target_http(cli.size, cli.resp_size, false).await?,
 		Workload::Ttfb => unreachable!(),
 	};
 
@@ -453,6 +469,7 @@ async fn run_load(cli: &Cli, url: &Uri, report: &mut Report) -> Result<()> {
 		bytes: AtomicU64::new(0),
 		ops: AtomicU64::new(0),
 		errors: AtomicU64::new(0),
+		truncated: AtomicU64::new(0),
 		latencies: Mutex::new(Vec::new()),
 	});
 
@@ -463,9 +480,9 @@ async fn run_load(cli: &Cli, url: &Uri, report: &mut Report) -> Result<()> {
 		for _ in 0..cli.streams {
 			let client = client.clone();
 			let shared = shared.clone();
-			let (workload, size) = (cli.workload, cli.size);
+			let (workload, size, resp_size) = (cli.workload, cli.size, cli.resp_size);
 			tasks.push(tokio::spawn(async move {
-				if let Err(err) = worker(&client, target, workload, size, &shared).await {
+				if let Err(err) = worker(&client, target, workload, size, resp_size, &shared).await {
 					if !shared.stop.load(Ordering::Relaxed) {
 						eprintln!("worker error: {err:?}");
 						shared.errors.fetch_add(1, Ordering::Relaxed);
@@ -477,7 +494,9 @@ async fn run_load(cli: &Cli, url: &Uri, report: &mut Report) -> Result<()> {
 
 	tokio::time::sleep(Duration::from_secs_f64(cli.warmup)).await;
 	let bytes_before = shared.bytes.load(Ordering::Relaxed);
+	let sink_before = SINK_RECEIVED.load(Ordering::Relaxed);
 	let ops_before = shared.ops.load(Ordering::Relaxed);
+	let truncated_before = shared.truncated.load(Ordering::Relaxed);
 	let cpu_before = cli.server_pid.and_then(process_cpu_seconds);
 	let self_before = process_cpu_seconds(std::process::id());
 	let start = Instant::now();
@@ -487,7 +506,13 @@ async fn run_load(cli: &Cli, url: &Uri, report: &mut Report) -> Result<()> {
 
 	shared.measuring.store(false, Ordering::Relaxed);
 	let elapsed = start.elapsed().as_secs_f64();
-	let bytes = shared.bytes.load(Ordering::Relaxed) - bytes_before;
+	let mut bytes = shared.bytes.load(Ordering::Relaxed) - bytes_before;
+	if let Workload::Upload = cli.workload {
+		// count what arrived, not what was written: a server may drop data
+		report.upload_written_mib_per_sec =
+			Some(bytes as f64 / start.elapsed().as_secs_f64() / (1024.0 * 1024.0));
+		bytes = SINK_RECEIVED.load(Ordering::Relaxed) - sink_before;
+	}
 	let ops = shared.ops.load(Ordering::Relaxed) - ops_before;
 	let cpu = cpu_before
 		.zip(cli.server_pid.and_then(process_cpu_seconds))
@@ -496,12 +521,20 @@ async fn run_load(cli: &Cli, url: &Uri, report: &mut Report) -> Result<()> {
 		.zip(process_cpu_seconds(std::process::id()))
 		.map(|(a, b)| b - a);
 	shared.stop.store(true, Ordering::Relaxed);
+	// rr/churn workers stop at the next operation and hand in their latencies
+	let _ = tokio::time::timeout(Duration::from_millis(500), async {
+		for task in &mut tasks {
+			let _ = task.await;
+		}
+	})
+	.await;
 	for task in &tasks {
 		task.abort();
 	}
 
 	report.seconds = elapsed;
 	report.errors = shared.errors.load(Ordering::Relaxed);
+	report.truncated = shared.truncated.load(Ordering::Relaxed) - truncated_before;
 	report.server_cpu_seconds = cpu;
 	match cli.workload {
 		Workload::Download | Workload::Upload => {
@@ -527,6 +560,7 @@ async fn worker(
 	target: SocketAddr,
 	workload: Workload,
 	size: usize,
+	resp_size: usize,
 	shared: &Shared,
 ) -> Result<()> {
 	let mut latencies = Vec::new();
@@ -568,6 +602,9 @@ async fn worker(
 					if shared.stop.load(Ordering::Relaxed) {
 						return Ok(());
 					}
+					if latencies.len() >= 256 {
+						shared.latencies.lock().unwrap().append(&mut latencies);
+					}
 				}
 			}
 			Workload::Churn => {
@@ -578,8 +615,25 @@ async fn worker(
 					let mut stream = client.open(target).await?;
 					stream.write_all(&request).await?;
 					stream.flush().await?;
-					while stream.read(&mut buf).await? > 0 {}
+					let mut received = 0;
+					loop {
+						let n = stream.read(&mut buf).await?;
+						if n == 0 {
+							break;
+						}
+						received += n;
+					}
 					drop(stream);
+					if received != resp_size {
+						// a truncated response is a failure, not a fast success
+						if shared.measuring.load(Ordering::Relaxed) {
+							shared.truncated.fetch_add(1, Ordering::Relaxed);
+						}
+						if shared.stop.load(Ordering::Relaxed) {
+							return Ok(());
+						}
+						continue;
+					}
 					shared.ops.fetch_add(1, Ordering::Relaxed);
 					if shared.measuring.load(Ordering::Relaxed) {
 						latencies.push(start.elapsed().as_micros() as u64);
@@ -587,8 +641,7 @@ async fn worker(
 					if shared.stop.load(Ordering::Relaxed) {
 						return Ok(());
 					}
-					// keep the latency buffer from growing without bound on long runs
-					if latencies.len() >= 4096 {
+					if latencies.len() >= 256 {
 						shared.latencies.lock().unwrap().append(&mut latencies);
 					}
 				}
@@ -614,6 +667,9 @@ fn print_report(r: &Report) {
 	);
 	if let Some(x) = r.mib_per_sec {
 		println!("  throughput: {x:.1} MiB/s");
+	}
+	if let Some(x) = r.upload_written_mib_per_sec {
+		println!("  written by client: {x:.1} MiB/s");
 	}
 	if let Some(x) = r.ops_per_sec {
 		println!(
@@ -644,5 +700,8 @@ fn print_report(r: &Report) {
 	}
 	if r.errors > 0 {
 		println!("  errors: {}", r.errors);
+	}
+	if r.truncated > 0 {
+		println!("  truncated responses: {}", r.truncated);
 	}
 }

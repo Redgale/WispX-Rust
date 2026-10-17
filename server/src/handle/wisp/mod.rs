@@ -3,7 +3,12 @@ pub mod twisp;
 pub mod utils;
 pub mod wispnet;
 
-use std::{collections::VecDeque, io::IoSlice, sync::Arc, time::Duration};
+use std::{
+	collections::VecDeque,
+	io::IoSlice,
+	sync::Arc,
+	time::{Duration, Instant},
+};
 
 use anyhow::Context;
 use bytes::{Buf, Bytes, BytesMut};
@@ -93,6 +98,7 @@ async fn copy_tcp(
 	let download = async {
 		let read_size = CONFIG.stream.buffer_size.max(4096);
 		let mut buf = BytesMut::new();
+		let mut last_send = None;
 		loop {
 			// reclaims the old allocation once the multiplexor is done with the previous chunk
 			buf.reserve(read_size);
@@ -103,6 +109,12 @@ async fn copy_tcp(
 				.send(buf.split().freeze())
 				.await
 				.map_err(std::io::Error::other)?;
+			last_send = Some(Instant::now());
+		}
+		// see `WispConfig::v2_close_delay_ms`: only data sent shortly before is at risk
+		if let (false, Some(last_send)) = (half_close, last_send) {
+			let delay = Duration::from_millis(CONFIG.wisp.v2_close_delay_ms);
+			tokio::time::sleep(delay.saturating_sub(last_send.elapsed())).await;
 		}
 		muxtx.finish().await.map_err(std::io::Error::other)
 	};

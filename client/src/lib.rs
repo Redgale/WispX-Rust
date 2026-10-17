@@ -237,6 +237,8 @@ cfg_if! {
 		#[wasm_bindgen]
 		pub struct EpoxyClientOptions {
 			pub wisp_v2: bool,
+			/// Use WispX (falls back to Wisp v2/v1 if the server doesn't support it).
+			pub wispx: bool,
 			pub udp_extension_required: bool,
 			pub title_case_headers: bool,
 			pub ws_title_case_headers: bool,
@@ -255,6 +257,8 @@ cfg_if! {
 		#[wasm_bindgen]
 		pub struct EpoxyClientOptions {
 			pub wisp_v2: bool,
+			/// Use WispX (falls back to Wisp v2/v1 if the server doesn't support it).
+			pub wispx: bool,
 			pub udp_extension_required: bool,
 			pub title_case_headers: bool,
 			#[wasm_bindgen(getter_with_clone)]
@@ -281,6 +285,7 @@ impl Default for EpoxyClientOptions {
 	fn default() -> Self {
 		Self {
 			wisp_v2: false,
+			wispx: false,
 			udp_extension_required: false,
 			title_case_headers: false,
 			#[cfg(feature = "full")]
@@ -404,11 +409,16 @@ impl EpoxyClient {
 			}
 
 			let ws_protocols = options.websocket_protocols.clone();
+			let wispx = options.wispx;
 			Arc::new(StreamProvider::new(
 				Box::new(move |wisp_v2| {
 					let wisp_url = wisp_url.clone();
 					let mut ws_protocols = ws_protocols.clone();
-					if wisp_v2 {
+					if wispx {
+						// a WispX server answers with this exact token, older servers echo it and
+						// speak v2, which the client detects and falls back to
+						ws_protocols.push(wisp_mux::WISPX_WS_PROTOCOL.to_string());
+					} else if wisp_v2 {
 						// send some random data to ask the server for v2
 						ws_protocols.push(ws_protocol());
 					}
