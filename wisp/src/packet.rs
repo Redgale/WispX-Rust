@@ -5,8 +5,9 @@ use num_enum::{FromPrimitive, IntoPrimitive};
 
 use crate::{
 	extensions::{AnyProtocolExtension, AnyProtocolExtensionBuilder},
-	ws::{Payload, PayloadMut, PayloadRef, TransportRead, TransportWrite},
-	LockedWebSocketWrite, Role, WispError, WISP_VERSION,
+	frame::{TY_INFO, X_HEADER_LEN},
+	ws::{Payload, PayloadMut, PayloadRef},
+	Role, WispError, WISPX_VERSION, WISP_VERSION,
 };
 
 trait PacketCodec: Sized {
@@ -54,6 +55,9 @@ pub enum CloseReason {
 	Unexpected = 0x03,
 	/// Incompatible extensions.
 	ExtensionsIncompatible = 0x04,
+	/// Protocol violation, such as sending more data than the flow control credit allows.
+	/// (WispX)
+	ProtocolViolation = 0x05,
 
 	/// Stream creation failed due to invalid information.
 	ServerStreamInvalidInfo = 0x41,
@@ -99,6 +103,7 @@ impl Display for CloseReason {
 				C::Voluntary => "Voluntarily closed",
 				C::Unexpected => "Unexpectedly closed",
 				C::ExtensionsIncompatible => "Incompatible protocol extensions",
+				C::ProtocolViolation => "Protocol violation",
 
 				C::ServerStreamInvalidInfo => "Stream creation failed due to invalid information",
 				C::ServerStreamUnreachable =>
@@ -146,6 +151,12 @@ pub struct ConnectPacket {
 
 	pub host: String,
 	pub port: u16,
+}
+
+impl ConnectPacket {
+	pub(crate) fn decode_payload(mut payload: Payload) -> Result<Self, WispError> {
+		<Self as PacketCodec>::decode(&mut payload)
+	}
 }
 
 impl PacketCodec for ConnectPacket {
@@ -262,6 +273,31 @@ pub struct InfoPacket {
 	pub extensions: Vec<AnyProtocolExtension>,
 }
 
+fn decode_extensions(
+	packet: &mut Payload,
+	builders: &mut [AnyProtocolExtensionBuilder],
+	role: Role,
+) -> Result<Vec<AnyProtocolExtension>, WispError> {
+	let mut extensions = Vec::new();
+
+	while packet.remaining() >= (size_of::<u8>() + size_of::<u32>()) {
+		let id = packet.get_u8();
+		let length = usize::try_from(packet.get_u32_le())?;
+
+		if packet.remaining() < length {
+			return Err(WispError::PacketTooSmall);
+		}
+
+		if let Some(builder) = builders.iter_mut().find(|x| x.get_id() == id) {
+			extensions.push(builder.build_from_bytes(packet.split_to(length), role)?);
+		} else {
+			packet.advance(length);
+		}
+	}
+
+	Ok(extensions)
+}
+
 impl InfoPacket {
 	pub(crate) fn decode(
 		packet: &mut Payload,
@@ -284,23 +320,7 @@ impl InfoPacket {
 			));
 		}
 
-		let mut extensions = Vec::new();
-
-		while packet.remaining() >= (size_of::<u8>() + size_of::<u32>()) {
-			// We have some extensions
-			let id = packet.get_u8();
-			let length = usize::try_from(packet.get_u32_le())?;
-
-			if packet.remaining() < length {
-				return Err(WispError::PacketTooSmall);
-			}
-
-			if let Some(builder) = builders.iter_mut().find(|x| x.get_id() == id) {
-				extensions.push(builder.build_from_bytes(packet.split_to(length), role)?);
-			} else {
-				packet.advance(length);
-			}
-		}
+		let extensions = decode_extensions(packet, builders, role)?;
 
 		Ok(Self {
 			version,
@@ -313,11 +333,75 @@ impl InfoPacket {
 			size_of::<u8>() + size_of::<u32>() + self.version.size_hint(),
 		);
 		packet.put_u8(0x05);
-		packet.put_u32(0);
+		packet.put_u32_le(0);
 		self.version.encode_into(&mut packet);
 		for extension in &self.extensions {
 			extension.encode_into(&mut packet);
 		}
+		packet.freeze()
+	}
+}
+
+/// WispX HELLO packet.
+#[derive(Debug, Clone)]
+pub struct HelloPacket {
+	pub version: WispVersion,
+	/// Largest websocket message the sender accepts.
+	pub max_message_size: u32,
+	/// Initial credit, in bytes, the sender grants its peer on every flow controlled stream.
+	pub stream_window: u32,
+	pub extensions: Vec<AnyProtocolExtension>,
+}
+
+impl HelloPacket {
+	/// Decode the payload of a HELLO frame (everything after the 9 byte frame header).
+	pub(crate) fn decode(
+		mut packet: Payload,
+		builders: &mut [AnyProtocolExtensionBuilder],
+		role: Role,
+	) -> Result<Self, WispError> {
+		if packet.remaining() < 2 + 4 + 4 {
+			return Err(WispError::PacketTooSmall);
+		}
+
+		let version = WispVersion {
+			major: packet.get_u8(),
+			minor: packet.get_u8(),
+		};
+		if version.major != WISPX_VERSION.major {
+			return Err(WispError::IncompatibleProtocolVersion(
+				version,
+				WISPX_VERSION,
+			));
+		}
+
+		let max_message_size = packet.get_u32_le();
+		let stream_window = packet.get_u32_le();
+		let extensions = decode_extensions(&mut packet, builders, role)?;
+
+		Ok(Self {
+			version,
+			max_message_size,
+			stream_window,
+			extensions,
+		})
+	}
+
+	/// Encode as a full WispX frame on stream 0.
+	pub(crate) fn encode(&self) -> Payload {
+		let mut packet = PayloadMut::with_capacity(X_HEADER_LEN + 10);
+		packet.put_u8(TY_INFO);
+		packet.put_u32_le(0);
+		packet.put_u32_le(0);
+		self.version.encode_into(&mut packet);
+		packet.put_u32_le(self.max_message_size);
+		packet.put_u32_le(self.stream_window);
+		for extension in &self.extensions {
+			extension.encode_into(&mut packet);
+		}
+		#[expect(clippy::cast_possible_truncation)]
+		let len = (packet.len() - X_HEADER_LEN) as u32;
+		packet[5..9].copy_from_slice(&len.to_le_bytes());
 		packet.freeze()
 	}
 }
@@ -366,75 +450,6 @@ impl PacketType<'_> {
 			0x04 => PacketType::Close(ClosePacket::decode(&mut packet)?),
 			x => return Err(WispError::InvalidPacketType(x)),
 		})
-	}
-}
-
-pub(crate) enum MaybeInfoPacket<'a> {
-	Packet(Packet<'a>),
-	Info(InfoPacket),
-}
-
-impl MaybeInfoPacket<'static> {
-	pub(crate) fn decode(
-		mut packet: Payload,
-		builders: &mut [AnyProtocolExtensionBuilder],
-		role: Role,
-	) -> Result<Self, WispError> {
-		if packet.remaining() < size_of::<u8>() + size_of::<u32>() {
-			return Err(WispError::PacketTooSmall);
-		}
-
-		let ty = packet.get_u8();
-		let stream_id = packet.get_u32_le();
-
-		if ty == 0x05 {
-			Ok(Self::Info(InfoPacket::decode(&mut packet, builders, role)?))
-		} else {
-			Ok(Self::Packet(Packet {
-				stream_id,
-				packet_type: PacketType::decode(packet, ty)?,
-			}))
-		}
-	}
-}
-
-pub(crate) enum MaybeExtensionPacket<'a> {
-	Packet(Packet<'a>),
-	ExtensionHandled,
-}
-
-impl MaybeExtensionPacket<'static> {
-	pub(crate) async fn decode<W: TransportWrite>(
-		mut packet: Payload,
-		extensions: &mut [AnyProtocolExtension],
-		rx: &mut dyn TransportRead,
-		tx: &mut LockedWebSocketWrite<W>,
-	) -> Result<Self, WispError> {
-		if packet.remaining() < size_of::<u8>() + size_of::<u32>() {
-			return Err(WispError::PacketTooSmall);
-		}
-
-		let ty = packet.get_u8();
-		let stream_id = packet.get_u32_le();
-
-		if (0x01..=0x04).contains(&ty) {
-			Ok(Self::Packet(Packet {
-				stream_id,
-				packet_type: PacketType::decode(packet, ty)?,
-			}))
-		} else {
-			tx.lock().await;
-			let mut handle = tx.get_handle();
-			for extension in extensions {
-				if extension.get_supported_packets().contains(&ty) {
-					extension.handle_packet(ty, packet, rx, &mut handle).await?;
-					return Ok(Self::ExtensionHandled);
-				}
-			}
-			drop(handle);
-
-			Err(WispError::InvalidPacketType(ty))
-		}
 	}
 }
 

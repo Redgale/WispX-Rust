@@ -42,7 +42,7 @@ embedded-io-async = ["dep:embedded-io-async","embedded-io-async/std"]
 embedded-nal-async = ["dep:embedded-nal-async","embedded-io-async"]
 
 [dev-dependencies]
-tokio = { version = "1.42.0", features = ["macros", "rt", "time"] }
+tokio = { version = "1.42.0", features = ["macros", "rt", "rt-multi-thread", "time"] }
 
 [package.metadata.docs.rs]
 all-features = true

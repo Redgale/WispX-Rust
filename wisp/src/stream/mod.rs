@@ -1,16 +1,18 @@
 use std::{
+	future::poll_fn,
+	marker::PhantomData,
 	pin::Pin,
 	sync::Arc,
 	task::{ready, Context, Poll},
 };
 
-use futures::{channel::oneshot, FutureExt, Sink, SinkExt, Stream, StreamExt};
+use futures::{Sink, Stream};
 
 use crate::{
-	mux::inner::{FlowControl, StreamInfo, WsEvent},
-	packet::{ClosePacket, CloseReason, Packet},
-	ws::{Payload, TransportWrite},
-	LockedWebSocketWrite, WispError,
+	mux::shared::{MuxShared, StreamShared},
+	packet::{CloseReason, StreamType},
+	ws::Payload,
+	WispError,
 };
 
 mod compat;
@@ -18,54 +20,102 @@ mod handles;
 pub use compat::*;
 pub use handles::*;
 
-macro_rules! unlock_some {
-	($unlock:expr, $x:expr) => {
-		if let Err(err) = $x {
-			$unlock.unlock();
-			return Poll::Ready(Some(Err(err)));
+/// A counted reference to a stream. The stream is closed when the last one is dropped.
+pub(crate) struct StreamRef {
+	pub mux: Arc<MuxShared>,
+	pub stream: Arc<StreamShared>,
+}
+
+impl StreamRef {
+	pub fn new(mux: Arc<MuxShared>, stream: Arc<StreamShared>) -> Self {
+		mux.acquire_stream_handle(&stream);
+		Self { mux, stream }
+	}
+
+	pub fn id(&self) -> u32 {
+		self.stream.id
+	}
+
+	pub fn close_reason(&self) -> Option<CloseReason> {
+		self.mux.close_reason(&self.stream)
+	}
+
+	pub fn close(&self, reason: CloseReason) -> Result<(), WispError> {
+		self.mux.close_stream(&self.stream, reason)
+	}
+
+	pub fn poll_recv(&self, cx: &mut Context<'_>) -> Poll<Option<Payload>> {
+		self.mux.poll_recv(&self.stream, cx)
+	}
+
+	/// Send everything in `pending`, waiting for credit as needed.
+	pub fn poll_send_all(
+		&self,
+		cx: &mut Context<'_>,
+		pending: &mut Option<Payload>,
+	) -> Poll<Result<(), WispError>> {
+		while pending.is_some() {
+			if let Err(err) = ready!(self.mux.poll_send_ready(&self.stream, cx)) {
+				return Poll::Ready(Err(err));
+			}
+			let Some(data) = pending.take() else {
+				break;
+			};
+			match self.mux.send_data(&self.stream, data) {
+				Ok(rest) if rest.is_empty() => {}
+				Ok(rest) => *pending = Some(rest),
+				Err(err) => return Poll::Ready(Err(err)),
+			}
 		}
-	};
-}
-macro_rules! unlock {
-	($unlock:expr, $x:expr) => {
-		if let Err(err) = $x {
-			$unlock.unlock();
-			return Poll::Ready(Err(err));
+		Poll::Ready(Ok(()))
+	}
+
+	pub fn finish(&self) -> Result<(), WispError> {
+		match self.mux.finish_stream(&self.stream) {
+			// shutting down an already closed stream is not an error
+			Err(WispError::StreamAlreadyClosed) => Ok(()),
+			x => x,
 		}
-	};
+	}
 }
 
-pub struct MuxStreamRead<W: TransportWrite> {
-	inner: flume::r#async::RecvStream<'static, Payload>,
-	write: LockedWebSocketWrite<W>,
-	info: Arc<StreamInfo>,
-
-	read_cnt: u32,
-	chunk: Option<Payload>,
+impl Clone for StreamRef {
+	fn clone(&self) -> Self {
+		Self::new(self.mux.clone(), self.stream.clone())
+	}
 }
 
-impl<W: TransportWrite> MuxStreamRead<W> {
-	fn new(
-		inner: flume::Receiver<Payload>,
-		write: LockedWebSocketWrite<W>,
-		info: Arc<StreamInfo>,
-	) -> Self {
+impl Drop for StreamRef {
+	fn drop(&mut self) {
+		self.mux.release_stream_handle(&self.stream);
+	}
+}
+
+/// Read half of a multiplexor stream.
+pub struct MuxStreamRead<W> {
+	pub(crate) inner: StreamRef,
+	_phantom: PhantomData<fn() -> W>,
+}
+
+impl<W> MuxStreamRead<W> {
+	pub(crate) fn new(inner: StreamRef) -> Self {
 		Self {
-			inner: inner.into_stream(),
-			write,
-			info,
-
-			chunk: None,
-			read_cnt: 0,
+			inner,
+			_phantom: PhantomData,
 		}
 	}
 
 	pub fn get_stream_id(&self) -> u32 {
-		self.info.id
+		self.inner.id()
 	}
 
+	pub fn get_stream_type(&self) -> StreamType {
+		self.inner.stream.stream_type
+	}
+
+	/// The reason the stream was closed, if it was.
 	pub fn get_close_reason(&self) -> Option<CloseReason> {
-		self.inner.is_disconnected().then(|| self.info.get_reason())
+		self.inner.close_reason()
 	}
 
 	pub fn into_async_read(self) -> MuxStreamAsyncRead<W> {
@@ -73,233 +123,119 @@ impl<W: TransportWrite> MuxStreamRead<W> {
 	}
 }
 
-impl<W: TransportWrite> Stream for MuxStreamRead<W> {
+impl<W> Stream for MuxStreamRead<W> {
 	type Item = Result<Payload, WispError>;
 
-	fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-		if self.inner.is_disconnected() {
-			return Poll::Ready(None);
-		}
-
-		let was_reading = self.chunk.is_some();
-		let chunk = if let Some(chunk) = self.chunk.take() {
-			chunk
-		} else {
-			let Some(chunk) = ready!(self.inner.poll_next_unpin(cx)) else {
-				return Poll::Ready(None);
-			};
-			chunk
-		};
-
-		macro_rules! ready {
-			($x:expr) => {
-				match $x {
-					Poll::Ready(x) => x,
-					Poll::Pending => {
-						self.chunk = Some(chunk);
-						return Poll::Pending;
-					}
-				}
-			};
-		}
-
-		if self.info.flow_status == FlowControl::EnabledSendMessages {
-			if !was_reading {
-				self.read_cnt += 1;
-			}
-
-			if self.read_cnt > self.info.target_flow_control {
-				ready!(self.write.poll_lock(cx));
-				unlock_some!(self.write, ready!(self.write.get().poll_ready(cx)));
-				let pkt =
-					Packet::new_continue(self.info.id, self.info.flow_add(self.read_cnt)).encode();
-				unlock_some!(self.write, self.write.get().start_send(pkt));
-				self.write.unlock();
-
-				self.read_cnt = 0;
-			}
-		}
-
-		Poll::Ready(Some(Ok(chunk)))
+	fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+		self.inner.poll_recv(cx).map(|x| x.map(Ok))
 	}
 }
 
-pub struct MuxStreamWrite<W: TransportWrite> {
-	inner: flume::r#async::SendSink<'static, WsEvent<W>>,
-	write: LockedWebSocketWrite<W>,
-	info: Arc<StreamInfo>,
-
-	chunk: Option<Payload>,
-
-	oneshot: Option<oneshot::Receiver<Result<(), WispError>>>,
+/// Write half of a multiplexor stream.
+pub struct MuxStreamWrite<W> {
+	pub(crate) inner: StreamRef,
+	pending: Option<Payload>,
+	_phantom: PhantomData<fn() -> W>,
 }
 
-impl<W: TransportWrite> MuxStreamWrite<W> {
-	fn new(
-		inner: flume::Sender<WsEvent<W>>,
-		write: LockedWebSocketWrite<W>,
-		info: Arc<StreamInfo>,
-	) -> Self {
+impl<W> MuxStreamWrite<W> {
+	pub(crate) fn new(inner: StreamRef) -> Self {
 		Self {
-			inner: inner.into_sink(),
-			write,
-			info,
-
-			chunk: None,
-
-			oneshot: None,
+			inner,
+			pending: None,
+			_phantom: PhantomData,
 		}
 	}
 
 	pub fn get_stream_id(&self) -> u32 {
-		self.info.id
+		self.inner.id()
 	}
 
+	pub fn get_stream_type(&self) -> StreamType {
+		self.inner.stream.stream_type
+	}
+
+	/// The reason the stream was closed, if it was.
 	pub fn get_close_reason(&self) -> Option<CloseReason> {
-		self.inner.is_disconnected().then(|| self.info.get_reason())
+		self.inner.close_reason()
 	}
 
 	pub fn get_close_handle(&self) -> MuxStreamCloser<W> {
-		MuxStreamCloser {
-			info: self.info.clone(),
-			inner: self.inner.sender().clone(),
-		}
+		MuxStreamCloser::new(self.inner.clone())
 	}
 
 	pub fn get_protocol_extension_stream(&self) -> MuxProtocolExtensionStream<W> {
-		MuxProtocolExtensionStream {
-			info: self.info.clone(),
-			tx: self.write.clone(),
-			inner: self.inner.sender().clone(),
-		}
+		MuxProtocolExtensionStream::new(self.inner.clone())
 	}
 
 	/// Close the stream. You will no longer be able to write or read after this has been called.
 	pub async fn close(&self, reason: CloseReason) -> Result<(), WispError> {
-		if self.inner.is_disconnected() {
-			return Err(WispError::StreamAlreadyClosed);
-		}
+		self.inner.close(reason)
+	}
 
-		let (tx, rx) = oneshot::channel::<Result<(), WispError>>();
-		let evt = WsEvent::Close(self.info.id, ClosePacket { reason }, tx);
-
-		self.inner
-			.sender()
-			.send_async(evt)
-			.await
-			.map_err(|_| WispError::MuxMessageFailedToSend)?;
-		rx.await.map_err(|_| WispError::MuxMessageFailedToRecv)??;
-
-		Ok(())
+	/// Half-close the stream: send any buffered data, then tell the peer no more data is coming.
+	/// Reading continues to work. On Wisp v1/v2, which have no half-close, this closes the stream.
+	pub async fn finish(&mut self) -> Result<(), WispError> {
+		poll_fn(|cx| self.inner.poll_send_all(cx, &mut self.pending)).await?;
+		self.inner.finish()
 	}
 
 	pub fn into_async_write(self) -> MuxStreamAsyncWrite<W> {
 		MuxStreamAsyncWrite::new(self)
 	}
-
-	fn maybe_write(&mut self) -> Result<(), WispError> {
-		if let Some(chunk) = self.chunk.take() {
-			let packet = Packet::new_data(self.info.id, chunk).encode();
-			self.write.get().start_send(packet)?;
-
-			if self.info.flow_status == FlowControl::EnabledTrackAmount {
-				self.info.flow_dec();
-			}
-		}
-
-		Ok(())
-	}
 }
 
-impl<W: TransportWrite> Sink<Payload> for MuxStreamWrite<W> {
+impl<W> Sink<Payload> for MuxStreamWrite<W> {
 	type Error = WispError;
 
-	fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-		if self.inner.is_disconnected() {
-			return Poll::Ready(Err(WispError::StreamAlreadyClosed));
-		}
-
-		if self.info.flow_status == FlowControl::EnabledTrackAmount && self.info.flow_empty() {
-			self.info.flow_register(cx);
-			return Poll::Pending;
-		}
-
-		if self.chunk.is_some() {
-			ready!(self.write.poll_lock(cx));
-			unlock!(self.write, ready!(self.write.get().poll_ready(cx)));
-			unlock!(self.write, self.maybe_write());
-			self.write.unlock();
-		}
-
-		Poll::Ready(Ok(()))
+	fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+		let this = self.get_mut();
+		ready!(this.inner.poll_send_all(cx, &mut this.pending))?;
+		// report a closed stream before the caller hands us data
+		this.inner.mux.poll_send_ready(&this.inner.stream, cx)
 	}
 
-	fn start_send(mut self: Pin<&mut Self>, item: Payload) -> Result<(), Self::Error> {
-		debug_assert!(self.chunk.is_none());
-		self.chunk = Some(item);
-
+	fn start_send(self: Pin<&mut Self>, item: Payload) -> Result<(), Self::Error> {
+		let this = self.get_mut();
+		debug_assert!(this.pending.is_none());
+		if !item.is_empty() {
+			// send what we can right away, so `feed` doesn't leave data sitting here
+			let rest = this.inner.mux.send_data(&this.inner.stream, item)?;
+			if !rest.is_empty() {
+				this.pending = Some(rest);
+			}
+		}
 		Ok(())
 	}
 
-	fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-		ready!(self.write.poll_lock(cx));
-
-		if self.chunk.is_some() {
-			unlock!(self.write, ready!(self.write.get().poll_ready(cx)));
-			unlock!(self.write, self.maybe_write());
-		}
-		unlock!(self.write, ready!(self.write.get().poll_flush(cx)));
-
-		self.write.unlock();
-		Poll::Ready(Ok(()))
+	fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+		let this = self.get_mut();
+		this.inner.poll_send_all(cx, &mut this.pending)
 	}
 
-	fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-		if let Some(oneshot) = &mut self.oneshot {
-			let ret = ready!(oneshot.poll_unpin(cx));
-			self.oneshot.take();
-			Poll::Ready(ret.map_err(|_| WispError::MuxMessageFailedToSend)?)
-		} else {
-			ready!(self.as_mut().poll_flush(cx))?;
-
-			ready!(self.inner.poll_ready_unpin(cx))
-				.map_err(|_| WispError::MuxMessageFailedToSend)?;
-
-			let (tx, rx) = oneshot::channel();
-			self.oneshot = Some(rx);
-
-			let pkt = WsEvent::Close(
-				self.info.id,
-				ClosePacket {
-					reason: CloseReason::Unknown,
-				},
-				tx,
-			);
-
-			self.inner
-				.start_send_unpin(pkt)
-				.map_err(|_| WispError::MuxMessageFailedToSend)?;
-
-			Poll::Pending
+	/// Half-closes the stream (WispX) or closes it (v1/v2) after sending buffered data.
+	fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+		let this = self.get_mut();
+		match ready!(this.inner.poll_send_all(cx, &mut this.pending)) {
+			Ok(()) | Err(WispError::StreamAlreadyClosed) => {}
+			Err(err) => return Poll::Ready(Err(err)),
 		}
+		Poll::Ready(this.inner.finish())
 	}
 }
 
-pub struct MuxStream<W: TransportWrite> {
+/// A multiplexor stream.
+pub struct MuxStream<W> {
 	read: MuxStreamRead<W>,
 	write: MuxStreamWrite<W>,
 }
 
-impl<W: TransportWrite> MuxStream<W> {
-	pub(crate) fn new(
-		rx: flume::Receiver<Payload>,
-		tx: flume::Sender<WsEvent<W>>,
-		ws: LockedWebSocketWrite<W>,
-		info: Arc<StreamInfo>,
-	) -> Self {
+impl<W> MuxStream<W> {
+	pub(crate) fn new(mux: Arc<MuxShared>, stream: Arc<StreamShared>) -> Self {
+		let inner = StreamRef::new(mux, stream);
 		Self {
-			read: MuxStreamRead::new(rx, ws.clone(), info.clone()),
-			write: MuxStreamWrite::new(tx, ws, info),
+			read: MuxStreamRead::new(inner.clone()),
+			write: MuxStreamWrite::new(inner),
 		}
 	}
 
@@ -307,6 +243,11 @@ impl<W: TransportWrite> MuxStream<W> {
 		self.read.get_stream_id()
 	}
 
+	pub fn get_stream_type(&self) -> StreamType {
+		self.read.get_stream_type()
+	}
+
+	/// The reason the stream was closed, if it was.
 	pub fn get_close_reason(&self) -> Option<CloseReason> {
 		self.read.get_close_reason()
 	}
@@ -333,34 +274,30 @@ impl<W: TransportWrite> MuxStream<W> {
 	}
 }
 
-impl<W: TransportWrite> Stream for MuxStream<W> {
+impl<W> Stream for MuxStream<W> {
 	type Item = <MuxStreamRead<W> as Stream>::Item;
 
 	fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-		self.read.poll_next_unpin(cx)
-	}
-
-	fn size_hint(&self) -> (usize, Option<usize>) {
-		self.read.size_hint()
+		Pin::new(&mut self.read).poll_next(cx)
 	}
 }
 
-impl<W: TransportWrite> Sink<Payload> for MuxStream<W> {
+impl<W> Sink<Payload> for MuxStream<W> {
 	type Error = <MuxStreamWrite<W> as Sink<Payload>>::Error;
 
 	fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-		self.write.poll_ready_unpin(cx)
+		Pin::new(&mut self.write).poll_ready(cx)
 	}
 
 	fn start_send(mut self: Pin<&mut Self>, item: Payload) -> Result<(), Self::Error> {
-		self.write.start_send_unpin(item)
+		Pin::new(&mut self.write).start_send(item)
 	}
 
 	fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-		self.write.poll_flush_unpin(cx)
+		Pin::new(&mut self.write).poll_flush(cx)
 	}
 
 	fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-		self.write.poll_close_unpin(cx)
+		Pin::new(&mut self.write).poll_close(cx)
 	}
 }

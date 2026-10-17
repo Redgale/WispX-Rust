@@ -1,197 +1,203 @@
+use std::{marker::PhantomData, sync::Arc};
+
 use futures::SinkExt;
 
 use crate::{
-	locked_sink::LockedWebSocketWrite,
-	packet::{CloseReason, ConnectPacket, MaybeInfoPacket, Packet, StreamType},
+	extensions::udp::UdpProtocolExtension,
+	frame::{OutFrame, Proto, TY_INFO},
+	packet::{CloseReason, ConnectPacket, HelloPacket, InfoPacket, Packet},
 	stream::MuxStream,
-	ws::{Payload, TransportRead, TransportReadExt, TransportWrite},
-	Role, WispError,
+	ws::{TransportRead, TransportReadExt, TransportWrite},
+	Role, WispError, WISPX_VERSION,
 };
 
 use super::{
-	get_supported_extensions, handle_handshake,
-	inner::{FlowControl, MultiplexorActor, StreamMap},
-	send_info_packet, Multiplexor, MultiplexorImpl, MuxResult, WispHandshakeResult,
-	WispHandshakeResultKind, WispV2Handshake,
+	get_supported_extensions, handle_handshake, send_info_packet, shared::StreamShared,
+	take_hello_frame, validate_x_options, Handshake, Multiplexor, MuxResult, WispV2Handshake,
+	WispXOptions,
 };
 
-pub(crate) struct ServerActor<W: TransportWrite> {
-	stream_tx: flume::Sender<(ConnectPacket, MuxStream<W>)>,
+/// Server side multiplexor state.
+pub struct ServerImpl<W> {
+	stream_rx: flume::Receiver<(ConnectPacket, Arc<StreamShared>)>,
+	_phantom: PhantomData<fn() -> W>,
 }
 
-impl<W: TransportWrite> MultiplexorActor<W> for ServerActor<W> {
-	fn handle_connect_packet(
-		&mut self,
-		stream: MuxStream<W>,
-		pkt: ConnectPacket,
-	) -> Result<(), WispError> {
-		self.stream_tx
-			.send((pkt, stream))
-			.map_err(|_| WispError::MuxMessageFailedToSend)
-	}
-
-	fn handle_data_packet(
-		&mut self,
-		id: u32,
-		pkt: Payload,
-		streams: &mut StreamMap,
-	) -> Result<(), WispError> {
-		if let Some(stream) = streams.get(&id) {
-			if stream.stream.try_send(pkt).is_ok() {
-				stream.info.flow_dec();
-			}
-		}
-		Ok(())
-	}
-
-	fn handle_continue_packet(
-		&mut self,
-		_: u32,
-		_: crate::packet::ContinuePacket,
-		_: &mut StreamMap,
-	) -> Result<(), WispError> {
-		Err(WispError::InvalidPacketType(0x03))
-	}
-
-	fn get_flow_control(ty: StreamType, flow_stream_types: &[u8]) -> FlowControl {
-		if flow_stream_types.contains(&ty.into()) {
-			FlowControl::EnabledSendMessages
-		} else {
-			FlowControl::Disabled
-		}
-	}
+/// Send the CLOSE matching a failed authentication, then close the transport.
+async fn handle_error<W: TransportWrite>(
+	err: WispError,
+	tx: &mut W,
+	proto: Proto,
+) -> Result<WispError, WispError> {
+	let reason = match err {
+		WispError::PasswordExtensionCredsInvalid => CloseReason::ExtensionsPasswordAuthFailed,
+		WispError::CertAuthExtensionSigInvalid => CloseReason::ExtensionsCertAuthFailed,
+		x => return Ok(x),
+	};
+	tx.send(OutFrame::close(0, reason).encode(proto)).await?;
+	tx.close().await?;
+	Ok(err)
 }
 
-pub struct ServerImpl<W: TransportWrite> {
+async fn handshake_v1_v2<R: TransportRead, W: TransportWrite>(
+	rx: &mut R,
+	tx: &mut W,
 	buffer_size: u32,
-	stream_rx: flume::Receiver<(ConnectPacket, MuxStream<W>)>,
+	wisp_v2: Option<WispV2Handshake>,
+) -> Result<Handshake, WispError> {
+	let continue_packet = Packet::new_continue(0, buffer_size).encode();
+
+	let Some(WispV2Handshake {
+		mut builders,
+		closure,
+	}) = wisp_v2
+	else {
+		// user asked for a v1 server
+		tx.send(continue_packet).await?;
+		return Ok(Handshake::v1_v2(
+			Proto::V1,
+			Role::Server,
+			vec![UdpProtocolExtension.into()],
+			buffer_size,
+		));
+	};
+
+	send_info_packet(tx, &mut builders, Role::Server).await?;
+	(closure)(&mut builders).await?;
+
+	let first = rx.next_erroring().await?;
+	if first.first() == Some(&TY_INFO) {
+		let mut packet = first.slice(5..);
+		let info = InfoPacket::decode(&mut packet, &mut builders, Role::Server)?;
+		let mut extensions = get_supported_extensions(info.extensions, &mut builders);
+		handle_handshake(rx, tx, &mut extensions).await?;
+		tx.send(continue_packet).await?;
+
+		Ok(Handshake::v1_v2(
+			Proto::V2,
+			Role::Server,
+			extensions,
+			buffer_size,
+		))
+	} else {
+		// a v1 client: its first packet is a normal one, hand it to the driver
+		let mut handshake = Handshake::v1_v2(
+			Proto::V1,
+			Role::Server,
+			vec![UdpProtocolExtension.into()],
+			buffer_size,
+		);
+		handshake.downgraded = true;
+		handshake.initial = Some(first);
+		Ok(handshake)
+	}
 }
 
-impl<W: TransportWrite> MultiplexorImpl<W> for ServerImpl<W> {
-	type Actor = ServerActor<W>;
-
-	async fn handshake<R: TransportRead>(
-		&mut self,
-		rx: &mut R,
-		tx: &mut LockedWebSocketWrite<W>,
-		v2: Option<WispV2Handshake>,
-	) -> Result<WispHandshakeResult, WispError> {
-		if let Some(WispV2Handshake {
+async fn handshake_x<R: TransportRead, W: TransportWrite>(
+	rx: &mut R,
+	tx: &mut W,
+	options: WispXOptions,
+) -> Result<Handshake, WispError> {
+	validate_x_options(&options)?;
+	let WispXOptions {
+		extensions: WispV2Handshake {
 			mut builders,
 			closure,
-		}) = v2
-		{
-			send_info_packet(tx, &mut builders, Role::Server).await?;
+		},
+		stream_window,
+		max_message_size,
+		max_batch_size,
+	} = options;
 
-			(closure)(&mut builders).await?;
-
-			let packet =
-				MaybeInfoPacket::decode(rx.next_erroring().await?, &mut builders, Role::Server)?;
-
-			match packet {
-				MaybeInfoPacket::Info(info) => {
-					let mut supported_extensions =
-						get_supported_extensions(info.extensions, &mut builders);
-
-					handle_handshake(rx, tx, &mut supported_extensions).await?;
-
-					tx.lock().await;
-					tx.get()
-						.send(Packet::new_continue(0, self.buffer_size).encode())
-						.await?;
-					tx.unlock();
-
-					// v2 client
-					Ok(WispHandshakeResult {
-						kind: WispHandshakeResultKind::V2 {
-							extensions: supported_extensions,
-						},
-						downgraded: false,
-						buffer_size: self.buffer_size,
-					})
-				}
-				MaybeInfoPacket::Packet(packet) => {
-					// downgrade to v1
-					Ok(WispHandshakeResult {
-						kind: WispHandshakeResultKind::V1 {
-							packet: Some(packet),
-						},
-						downgraded: true,
-						buffer_size: self.buffer_size,
-					})
-				}
-			}
-		} else {
-			// user asked for v1 server
-			tx.lock().await;
-			tx.get()
-				.send(Packet::new_continue(0, self.buffer_size).encode())
-				.await?;
-			tx.unlock();
-
-			Ok(WispHandshakeResult {
-				kind: WispHandshakeResultKind::V1 { packet: None },
-				downgraded: false,
-				buffer_size: self.buffer_size,
-			})
+	let extensions = builders
+		.iter_mut()
+		.map(|x| x.build_to_extension(Role::Server))
+		.collect::<Result<Vec<_>, _>>()?;
+	tx.send(
+		HelloPacket {
+			version: WISPX_VERSION,
+			max_message_size,
+			stream_window,
+			extensions,
 		}
-	}
+		.encode(),
+	)
+	.await?;
 
-	async fn handle_error(
-		&mut self,
-		err: WispError,
-		tx: &mut LockedWebSocketWrite<W>,
-	) -> Result<WispError, WispError> {
-		match err {
-			WispError::PasswordExtensionCredsInvalid => {
-				tx.lock().await;
-				tx.get()
-					.send(Packet::new_close(0, CloseReason::ExtensionsPasswordAuthFailed).encode())
-					.await?;
-				tx.get().close().await?;
-				tx.unlock();
-				Ok(err)
-			}
-			WispError::CertAuthExtensionSigInvalid => {
-				tx.lock().await;
-				tx.get()
-					.send(Packet::new_close(0, CloseReason::ExtensionsCertAuthFailed).encode())
-					.await?;
-				tx.get().close().await?;
-				tx.unlock();
-				Ok(err)
-			}
-			x => Ok(x),
-		}
+	(closure)(&mut builders).await?;
+
+	// the client HELLO comes first; frames after it in the same message are for the driver
+	let mut first = rx.next_erroring().await?;
+	let hello = HelloPacket::decode(take_hello_frame(&mut first)?, &mut builders, Role::Server)?;
+	let extensions = get_supported_extensions(hello.extensions, &mut builders);
+
+	let mut handshake = Handshake::x(
+		extensions,
+		max_batch_size,
+		stream_window,
+		hello.max_message_size,
+		hello.stream_window,
+	);
+	if !first.is_empty() {
+		handshake.initial = Some(first);
 	}
+	Ok(handshake)
 }
 
 impl<W: TransportWrite> Multiplexor<ServerImpl<W>, W> {
-	/// Create a new server-side multiplexor.
+	/// Create a new Wisp v1/v2 server-side multiplexor.
 	///
 	/// If `wisp_v2` is None a Wisp v1 connection is created, otherwise a Wisp v2 connection is created.
 	/// **It is not guaranteed that all extensions you specify are available.** You must manually check
 	/// if the extensions you need are available after the multiplexor has been created.
 	#[expect(clippy::new_ret_no_self)]
 	pub async fn new<R: TransportRead>(
-		rx: R,
-		tx: W,
+		mut rx: R,
+		mut tx: W,
 		buffer_size: u32,
 		wisp_v2: Option<WispV2Handshake>,
 	) -> Result<MuxResult<ServerImpl<W>, W>, WispError> {
+		match handshake_v1_v2(&mut rx, &mut tx, buffer_size, wisp_v2).await {
+			Ok(handshake) => Ok(Self::finish(rx, tx, handshake)),
+			Err(err) => Err(handle_error(err, &mut tx, Proto::V2).await?),
+		}
+	}
+
+	/// Create a new WispX server-side multiplexor. Use this when the client selected the
+	/// [`WISPX_WS_PROTOCOL`](crate::WISPX_WS_PROTOCOL) websocket subprotocol.
+	///
+	/// **It is not guaranteed that all extensions you specify are available.** You must manually check
+	/// if the extensions you need are available after the multiplexor has been created.
+	pub async fn new_wispx<R: TransportRead>(
+		mut rx: R,
+		mut tx: W,
+		options: WispXOptions,
+	) -> Result<MuxResult<ServerImpl<W>, W>, WispError> {
+		match handshake_x(&mut rx, &mut tx, options).await {
+			Ok(handshake) => Ok(Self::finish(rx, tx, handshake)),
+			Err(err) => Err(handle_error(err, &mut tx, Proto::X).await?),
+		}
+	}
+
+	fn finish<R: TransportRead>(rx: R, tx: W, handshake: Handshake) -> MuxResult<ServerImpl<W>, W> {
 		let (stream_tx, stream_rx) = flume::unbounded();
-
-		let mux = ServerImpl {
-			buffer_size,
-			stream_rx,
-		};
-		let actor = ServerActor { stream_tx };
-
-		Self::create(rx, tx, wisp_v2, mux, actor).await
+		Self::build(
+			ServerImpl {
+				stream_rx,
+				_phantom: PhantomData,
+			},
+			Role::Server,
+			rx,
+			tx,
+			handshake,
+			Some(stream_tx),
+		)
 	}
 
 	/// Wait for a stream to be created.
 	pub async fn wait_for_stream(&self) -> Option<(ConnectPacket, MuxStream<W>)> {
-		self.mux.stream_rx.recv_async().await.ok()
+		let (connect, stream) = self.mux.stream_rx.recv_async().await.ok()?;
+		Some((connect, self.wrap_stream(stream)))
 	}
 }
+

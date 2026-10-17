@@ -6,19 +6,22 @@ use packet::WispVersion;
 use thiserror::Error as ErrorDerive;
 
 pub mod extensions;
-mod locked_sink;
-mod unfair_select;
+mod frame;
 mod mux;
 pub mod packet;
 pub mod stream;
 pub mod ws;
 
+pub use frame::WISPX_MIN_MESSAGE_SIZE;
 pub use mux::*;
 
-use locked_sink::LockedWebSocketWrite;
-pub use locked_sink::{LockedSinkGuard, LockedWebSocketWriteGuard};
-
+/// Latest supported Wisp v2 version.
 pub const WISP_VERSION: WispVersion = WispVersion { major: 2, minor: 0 };
+/// Latest supported WispX version.
+pub const WISPX_VERSION: WispVersion = WispVersion { major: 3, minor: 0 };
+
+/// WebSocket subprotocol token that selects WispX.
+pub const WISPX_WS_PROTOCOL: &str = "wispx";
 
 #[derive(Debug, ErrorDerive)]
 pub enum WispError {
@@ -41,6 +44,12 @@ pub enum WispError {
 	/// The max stream count was reached.
 	#[error("Maximum stream count reached")]
 	MaxStreamCountReached,
+	/// The peer closed the connection with an error reason, for example failed authentication.
+	#[error("Connection closed by peer: {0}")]
+	ClosedByPeer(crate::packet::CloseReason),
+	/// The peer violated the protocol.
+	#[error("Protocol violation: {0}")]
+	ProtocolViolation(&'static str),
 
 	/// Failed to parse bytes as UTF-8.
 	#[error("Invalid UTF-8: {0}")]
