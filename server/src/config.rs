@@ -169,6 +169,15 @@ pub struct WispConfig {
 
 	/// Whether or not to use Wisp version 2.
 	pub wisp_v2: bool,
+	/// Whether or not to use WispX (`protocolX.md`) for clients that offer the `wispx`
+	/// websocket subprotocol. Requires `wisp_v2`.
+	pub wispx: bool,
+	/// WispX: initial credit in bytes granted to the client on every new stream, i.e. how much
+	/// upload data the server buffers per stream.
+	pub wispx_stream_window: u32,
+	/// WispX: a stream's window grows up to this while the destination keeps up with the
+	/// client's uploads.
+	pub wispx_max_stream_window: u32,
 	/// Wisp version 2 extensions advertised.
 	pub extensions: Vec<ProtocolExtension>,
 	/// Wisp version 2 authentication extension advertised.
@@ -365,6 +374,9 @@ impl Default for WispConfig {
 			write_limit: f64::INFINITY,
 
 			wisp_v2: true,
+			wispx: true,
+			wispx_stream_window: 256 * 1024,
+			wispx_max_stream_window: 16 * 1024 * 1024,
 			extensions: vec![ProtocolExtension::Udp, ProtocolExtension::Motd],
 			auth_extension: None,
 

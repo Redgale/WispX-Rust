@@ -28,6 +28,26 @@ use super::shared::{MuxShared, WriterEvent};
 /// flushes regularly.
 const MAX_BYTES_PER_FLUSH: usize = 1024 * 1024;
 
+/// Returns `Pending` once, so the other half of the driver gets polled.
+///
+/// The read and write loops share one task. Without this, a constantly readable transport keeps
+/// the read loop busy until the runtime's budget runs out, and the frames it queues (credit
+/// updates, replies) wait behind megabytes of reading. The write loop doesn't need it: it
+/// returns `Pending` whenever the queue drains or the transport is full.
+async fn yield_now() {
+	let mut yielded = false;
+	poll_fn(|cx| {
+		if yielded {
+			Poll::Ready(())
+		} else {
+			yielded = true;
+			cx.waker().wake_by_ref();
+			Poll::Pending
+		}
+	})
+	.await;
+}
+
 /// Runs the connection until the transport closes, an error occurs, or a close is requested.
 pub(crate) async fn run<R: TransportRead, W: TransportWrite>(
 	shared: Arc<MuxShared>,
@@ -138,6 +158,11 @@ async fn read_loop<R: TransportRead>(
 			{
 				return Ok(());
 			}
+		}
+
+		// let the write loop send what we just queued (credit, replies) before reading more
+		if shared.has_queued_frames() {
+			yield_now().await;
 		}
 	}
 }

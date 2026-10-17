@@ -105,6 +105,7 @@ async fn handshake_x<R: TransportRead, W: TransportWrite>(
 			closure,
 		},
 		stream_window,
+		max_stream_window,
 		max_message_size,
 		max_batch_size,
 	} = options;
@@ -129,6 +130,7 @@ async fn handshake_x<R: TransportRead, W: TransportWrite>(
 		extensions,
 		max_batch_size,
 		stream_window,
+		max_stream_window,
 		hello.max_message_size,
 		hello.stream_window,
 	);

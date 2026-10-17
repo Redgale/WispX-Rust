@@ -733,3 +733,28 @@ async fn mt_many_streams_x() {
 async fn mt_close_keeps_queued_data_x() {
 	close_keeps_queued_data_case(Mode::X, Mode::X).await;
 }
+
+/// Streams opened concurrently must still reach the server with increasing IDs, which WispX
+/// requires.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mt_concurrent_open_x() {
+	let (client, server) = connect(Mode::X, Mode::X, 64 * 1024).await;
+	spawn_echo(server);
+	let client = Arc::new(client);
+	let mut tasks = Vec::new();
+	for i in 0..64u32 {
+		let client = client.clone();
+		tasks.push(tokio::spawn(async move {
+			for j in 0..20u32 {
+				let stream = client
+					.new_stream(StreamType::Tcp, "a".into(), 1)
+					.await
+					.unwrap();
+				echo_roundtrip(stream, 1000, (i + j) as u8).await;
+			}
+		}));
+	}
+	for task in tasks {
+		task.await.unwrap();
+	}
+}

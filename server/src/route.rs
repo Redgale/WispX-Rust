@@ -6,14 +6,16 @@ use futures_util::future::Either;
 use http_body_util::Full;
 use hyper::{
 	body::Incoming, header::SEC_WEBSOCKET_PROTOCOL, server::conn::http1::Builder,
-	service::service_fn, upgrade::OnUpgrade, HeaderMap, Request, Response, StatusCode,
+	header::HeaderValue, service::service_fn, upgrade::OnUpgrade, HeaderMap, Request, Response,
+	StatusCode,
 };
 use hyper_util::rt::TokioIo;
 use log::{debug, error, trace};
 use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
-use tokio_websockets::Limits;
-use wisp_mux::ws::{
-	TokioWebsocketsTransport, TransportExt, WebSocketSplitRead, WebSocketSplitWrite,
+use tokio_websockets::{Limits, ServerBuilder};
+use wisp_mux::{
+	ws::{TokioWebsocketsTransport, TransportExt, WebSocketSplitRead, WebSocketSplitWrite},
+	WISPX_WS_PROTOCOL,
 };
 
 use crate::{
@@ -37,10 +39,21 @@ pub type WispStreamWrite =
 	Either<WispWsStreamWrite, MapErr<FramedWrite<ServerStreamWrite, LengthDelimitedCodec>>>;
 pub type WispResult = (WispStreamRead, WispStreamWrite);
 
+/// Which Wisp protocol a client asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WispClientProtocol {
+	/// No websocket subprotocol: Wisp v1.
+	V1,
+	/// Some websocket subprotocol: Wisp v2.
+	V2,
+	/// The `wispx` websocket subprotocol.
+	X,
+}
+
 pub enum ServerRouteResult {
 	Wisp {
 		stream: WispResult,
-		has_ws_protocol: bool,
+		protocol: WispClientProtocol,
 	},
 	Wispnet {
 		stream: WispResult,
@@ -95,7 +108,7 @@ fn get_header(headers: &HeaderMap, header: &str) -> Option<String> {
 
 enum HttpUpgradeResult {
 	Wisp {
-		has_ws_protocol: bool,
+		protocol: WispClientProtocol,
 		is_wispnet: bool,
 	},
 	WsProxy {
@@ -143,14 +156,14 @@ where
 	let req_path = req.uri().path().to_string();
 
 	if req_path.ends_with(&(CONFIG.wisp.prefix.clone() + "/")) {
-		let has_ws_protocol = ws_protocol.is_some();
 		let is_wispnet =
 			CONFIG.wisp.has_wispnet() && req.uri().query().unwrap_or_default() == "net";
+		let (protocol, selected) = select_ws_protocol(ws_protocol);
 		tokio::spawn(async move {
 			if let Err(err) = (callback)(
 				fut,
 				HttpUpgradeResult::Wisp {
-					has_ws_protocol,
+					protocol,
 					is_wispnet,
 				},
 				ip_header,
@@ -160,9 +173,8 @@ where
 				error!("error while serving client: {:?}", err);
 			}
 		});
-		if let Some(protocol) = ws_protocol {
-			resp.headers_mut()
-				.append(SEC_WEBSOCKET_PROTOCOL, protocol.clone());
+		if let Some(selected) = selected {
+			resp.headers_mut().append(SEC_WEBSOCKET_PROTOCOL, selected);
 		}
 	} else if CONFIG.wisp.allow_wsproxy {
 		let udp = req.uri().query().unwrap_or_default() == "udp";
@@ -186,6 +198,44 @@ where
 	}
 
 	Ok(resp)
+}
+
+/// Pick the Wisp protocol and the single subprotocol token to answer with.
+///
+/// RFC 6455 requires the response to name exactly one of the offered tokens.
+fn select_ws_protocol(
+	header: Option<&HeaderValue>,
+) -> (WispClientProtocol, Option<HeaderValue>) {
+	let Some(header) = header else {
+		return (WispClientProtocol::V1, None);
+	};
+	let tokens = header
+		.to_str()
+		.unwrap_or_default()
+		.split(',')
+		.map(str::trim)
+		.filter(|x| !x.is_empty());
+
+	let mut first = None;
+	for token in tokens {
+		if CONFIG.wisp.wisp_v2 && CONFIG.wisp.wispx && token == WISPX_WS_PROTOCOL {
+			return (
+				WispClientProtocol::X,
+				Some(HeaderValue::from_static(WISPX_WS_PROTOCOL)),
+			);
+		}
+		first.get_or_insert(token);
+	}
+
+	let selected = first.and_then(|x| HeaderValue::from_str(x).ok());
+	(WispClientProtocol::V2, selected.or_else(|| Some(header.clone())))
+}
+
+fn ws_builder() -> ServerBuilder {
+	ServerBuilder::new()
+		.limits(Limits::default().max_payload_len(Some(CONFIG.server.max_message_size)))
+		// the multiplexor flushes once per batch, don't flush every 8 KiB in between
+		.config(tokio_websockets::Config::default().flush_threshold(256 * 1024))
 }
 
 pub async fn route_stats(stream: ServerStream) -> anyhow::Result<()> {
@@ -219,18 +269,14 @@ pub async fn route(
 
 								match res {
 									HttpUpgradeResult::Wisp {
-										has_ws_protocol,
+										protocol,
 										is_wispnet,
 									} => {
 										let ws = ws.downcast::<TokioIo<ServerStream>>().unwrap();
 										let ws =
 											chain(Cursor::new(ws.read_buf), ws.io.into_inner());
 
-										let ws = tokio_websockets::ServerBuilder::new()
-											.limits(Limits::default().max_payload_len(Some(
-												CONFIG.server.max_message_size,
-											)))
-											.serve(ws);
+										let ws = ws_builder().serve(ws);
 										let (read, write) =
 											TokioWebsocketsTransport(ws).split_fast();
 
@@ -241,18 +287,14 @@ pub async fn route(
 										} else {
 											ServerRouteResult::Wisp {
 												stream: (Either::Left(read), Either::Left(write)),
-												has_ws_protocol,
+												protocol,
 											}
 										};
 
 										(callback)(result, maybe_ip);
 									}
 									HttpUpgradeResult::WsProxy { path, udp } => {
-										let ws = tokio_websockets::ServerBuilder::new()
-											.limits(Limits::default().max_payload_len(Some(
-												CONFIG.server.max_message_size,
-											)))
-											.serve(TokioIo::new(ws));
+										let ws = ws_builder().serve(TokioIo::new(ws));
 										let ws = WebSocketStreamWrapper(ws);
 										(callback)(
 											ServerRouteResult::WsProxy {
@@ -286,7 +328,8 @@ pub async fn route(
 			(callback)(
 				ServerRouteResult::Wisp {
 					stream: (Either::Right(read), Either::Right(write)),
-					has_ws_protocol: true,
+					// no negotiation on this transport, so keep the protocol existing clients speak
+					protocol: WispClientProtocol::V2,
 				},
 				None,
 			);

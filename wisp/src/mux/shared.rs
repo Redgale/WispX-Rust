@@ -42,8 +42,10 @@ pub(crate) struct MuxParams {
 	/// WispX: bytes (peer's stream window). v1/v2 client: packets (server's buffer size).
 	pub tx_window: u64,
 	/// Receive window we grant on flow controlled streams.
-	/// WispX: bytes (our stream window). v1/v2 server: packets (our buffer size).
+	/// WispX: bytes (our initial stream window). v1/v2 server: packets (our buffer size).
 	pub rx_window: u64,
+	/// WispX: the receive window grows up to this for streams whose reader keeps up.
+	pub rx_max_window: u64,
 	/// Queued bytes above which data senders wait for the writer.
 	pub out_high_watermark: usize,
 	/// v1/v2: stream types that are flow controlled, besides TCP.
@@ -81,6 +83,10 @@ pub(crate) struct StreamState {
 	rx_unacked: u64,
 	/// WispX: how much more the peer may send before violating flow control.
 	rx_peer_credit: i64,
+	/// WispX: current receive window, see `account_consumed`.
+	rx_window: u64,
+	/// WispX: bytes consumed since the window last grew.
+	rx_since_growth: u64,
 
 	pub tx_credit: u64,
 	tx_waker: Option<Waker>,
@@ -278,6 +284,11 @@ impl MuxShared {
 		}
 	}
 
+	/// Whether frames are waiting for the writer.
+	pub fn has_queued_frames(&self) -> bool {
+		!lock(&self.out).frames.is_empty()
+	}
+
 	/// Called by the writer: grab frames queued since the last poll without waiting.
 	pub fn try_take_frames(&self, buf: &mut VecDeque<OutFrame>, blocked: &mut Vec<Waker>) -> bool {
 		let mut out = lock(&self.out);
@@ -359,6 +370,8 @@ impl MuxShared {
 				rx_eof: false,
 				rx_unacked: 0,
 				rx_peer_credit,
+				rx_window: self.params.rx_window,
+				rx_since_growth: 0,
 				tx_credit,
 				tx_waker: None,
 				tx_fin: false,
@@ -378,20 +391,39 @@ impl MuxShared {
 	}
 
 	/// Client: allocate an ID, register a stream and queue its CONNECT.
+	///
+	/// The ID is allocated while holding the writer queue lock, so CONNECTs always go out in ID
+	/// order even when streams are opened concurrently (WispX requires increasing IDs).
 	pub fn open_stream(&self, connect: &ConnectPacket) -> Result<Arc<StreamShared>, WispError> {
 		if self.is_dead() {
 			return Err(WispError::MuxTaskEnded);
 		}
-		let id = self
-			.next_stream_id
-			.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| x.checked_add(1))
-			.map_err(|_| WispError::MaxStreamCountReached)?;
 
-		let stream = self.create_stream(id, connect.stream_type);
-		lock(&self.streams).insert(id, stream.clone());
-		if let Err(err) = self.enqueue(OutFrame::connect(id, connect)) {
-			self.remove_stream(id);
-			return Err(err);
+		let mut streams = lock(&self.streams);
+		let (stream, waker) = {
+			let mut out = lock(&self.out);
+			if !matches!(out.state, OutState::Open) {
+				return Err(WispError::MuxTaskEnded);
+			}
+			// 0 marks the ID space as exhausted
+			let id = self.next_stream_id.load(Ordering::Relaxed);
+			if id == 0 {
+				return Err(WispError::MaxStreamCountReached);
+			}
+			self.next_stream_id
+				.store(id.checked_add(1).unwrap_or(0), Ordering::Relaxed);
+
+			let stream = self.create_stream(id, connect.stream_type);
+			let frame = OutFrame::connect(id, connect);
+			out.bytes += frame.queued_len();
+			out.frames.push_back(frame);
+			(stream, out.writer.take())
+		};
+		streams.insert(stream.id, stream.clone());
+		drop(streams);
+
+		if let Some(waker) = waker {
+			waker.wake();
 		}
 		Ok(stream)
 	}
@@ -452,13 +484,28 @@ impl MuxShared {
 		{
 			return None;
 		}
-		let window = self.params.rx_window;
 		match self.params.proto {
 			Proto::X => {
 				state.rx_unacked += len as u64;
-				if state.rx_unacked >= (window / 4).max(1) {
-					let increment = state.rx_unacked;
+				state.rx_since_growth += len as u64;
+				// Grant in quarter-window steps. Smaller steps cost real throughput: every grant wakes
+				// the sending task, which then sends only a little before blocking again.
+				if state.rx_unacked >= (state.rx_window / 4).max(1) {
+					let mut increment = state.rx_unacked;
 					state.rx_unacked = 0;
+					// Window auto-tuning, like TCP slow start: every time the reader consumes a
+					// full window, double it (up to the max). Streams that are being read reach a
+					// window big enough for fast, high-latency links within a few round trips,
+					// and credit updates get rarer as the window grows. A stream nobody reads
+					// never grows, so unread data stays bounded by the initial window.
+					if state.rx_since_growth >= state.rx_window
+						&& state.rx_window < self.params.rx_max_window
+					{
+						let extra = state.rx_window.min(self.params.rx_max_window - state.rx_window);
+						state.rx_window += extra;
+						increment += extra;
+						state.rx_since_growth = 0;
+					}
 					#[expect(clippy::cast_possible_wrap)]
 					{
 						state.rx_peer_credit += increment as i64;
@@ -470,6 +517,7 @@ impl MuxShared {
 				}
 			}
 			Proto::V1 | Proto::V2 => {
+				let window = self.params.rx_window;
 				state.rx_unacked += 1;
 				if state.rx_unacked >= (window / 4).max(1) {
 					state.rx_unacked = 0;

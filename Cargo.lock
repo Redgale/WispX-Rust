@@ -3780,8 +3780,49 @@ dependencies = [
 ]
 
 [[package]]
+name = "wisp-bench"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "clap",
+ "futures",
+ "http",
+ "libc",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-websockets",
+ "wisp-mux",
+ "wisp-mux-legacy",
+]
+
+[[package]]
 name = "wisp-mux"
 version = "6.0.0"
+dependencies = [
+ "async-trait",
+ "bitflags",
+ "bytes",
+ "ed25519",
+ "embedded-io-async",
+ "embedded-nal-async",
+ "flume",
+ "futures",
+ "getrandom 0.3.3",
+ "num_enum",
+ "pin-project",
+ "rustc-hash",
+ "slab",
+ "thiserror 2.0.12",
+ "tokio",
+ "tokio-tungstenite",
+ "tokio-websockets",
+]
+
+[[package]]
+name = "wisp-mux-legacy"
+version = "6.0.0-legacy"
 dependencies = [
  "async-trait",
  "bitflags",

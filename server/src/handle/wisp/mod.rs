@@ -3,38 +3,45 @@ pub mod twisp;
 pub mod utils;
 pub mod wispnet;
 
-use std::{sync::Arc, time::Duration};
+use std::{collections::VecDeque, io::IoSlice, sync::Arc, time::Duration};
 
 use anyhow::Context;
+use bytes::{Buf, Bytes, BytesMut};
 use cfg_if::cfg_if;
 use event_listener::Event;
 use futures_util::{future::Either, FutureExt, SinkExt, StreamExt};
 use log::{debug, trace};
 use tokio::{
-	io::{AsyncWriteExt, BufReader},
+	io::{AsyncReadExt, AsyncWriteExt},
 	net::TcpStream,
 	select,
 	task::JoinSet,
 	time::interval,
 };
-use tokio_util::compat::{FuturesAsyncReadCompatExt, FuturesAsyncWriteCompatExt};
 use uuid::Uuid;
 use wisp_mux::{
 	packet::{CloseReason, ConnectPacket},
 	stream::MuxStream,
-	ServerMux,
+	ServerMux, WispProtocolVersion, WispXOptions, DEFAULT_WISPX_MAX_BATCH_SIZE,
 };
 use wispnet::route_wispnet;
 
 use crate::{
-	route::{WispResult, WispStreamWrite, WispWsStreamWrite},
+	route::{WispClientProtocol, WispResult, WispStreamWrite, WispWsStreamWrite},
 	stream::{ClientStream, ResolvedPacket},
 	CLIENTS, CONFIG,
 };
 
-async fn copy_fast(
+/// Relay a Wisp stream and a TCP socket until both directions are done.
+///
+/// Origin to client: reads go straight into a `BytesMut` whose frozen slices are queued on the
+/// multiplexor, so the data is copied once (into the outgoing websocket message). On WispX each
+/// direction finishes independently (FIN / `shutdown`). Wisp v1/v2 can't half-close, so the
+/// first direction to finish ends the stream, as before.
+async fn copy_tcp(
 	mux: MuxStream<WispStreamWrite>,
 	tcp: TcpStream,
+	half_close: bool,
 	#[cfg(feature = "speed-limit")] read_limit: async_speed_limit::Limiter<
 		async_speed_limit::clock::StandardClock,
 	>,
@@ -42,23 +49,72 @@ async fn copy_fast(
 		async_speed_limit::clock::StandardClock,
 	>,
 ) -> std::io::Result<()> {
-	let (muxrx, muxtx) = mux.into_async_rw().into_split();
-	let mut muxrx = muxrx.compat();
-	let mut muxtx = muxtx.compat_write();
-
-	let (tcprx, mut tcptx) = tcp.into_split();
+	let (muxrx, mut muxtx) = mux.into_split();
+	let (tcprx, tcptx) = tcp.into_split();
 
 	#[cfg(feature = "speed-limit")]
-	let tcprx = read_limit.limit(tcprx);
+	let mut tcprx = read_limit.limit(tcprx);
+	#[cfg(not(feature = "speed-limit"))]
+	let mut tcprx = tcprx;
 	#[cfg(feature = "speed-limit")]
 	let mut tcptx = write_limit.limit(tcptx);
+	#[cfg(not(feature = "speed-limit"))]
+	let mut tcptx = tcptx;
 
-	let mut tcprx = BufReader::with_capacity(CONFIG.stream.buffer_size, tcprx);
-
-	select! {
-		x = tokio::io::copy_buf(&mut muxrx, &mut tcptx) => x?,
-		x = tokio::io::copy(&mut tcprx, &mut muxtx) => x?,
+	let upload = async {
+		// everything already queued goes out in one vectored write
+		let mut muxrx = muxrx.ready_chunks(64);
+		while let Some(chunks) = muxrx.next().await {
+			let mut chunks = chunks
+				.into_iter()
+				.collect::<Result<VecDeque<Bytes>, _>>()
+				.map_err(std::io::Error::other)?;
+			while !chunks.is_empty() {
+				let slices: Vec<_> = chunks.iter().map(|x| IoSlice::new(x)).collect();
+				let mut written = tcptx.write_vectored(&slices).await?;
+				if written == 0 {
+					return Err(std::io::ErrorKind::WriteZero.into());
+				}
+				while written > 0 {
+					let front = chunks.front_mut().expect("wrote more than was queued");
+					if written >= front.len() {
+						written -= front.len();
+						chunks.pop_front();
+					} else {
+						front.advance(written);
+						written = 0;
+					}
+				}
+			}
+		}
+		tcptx.shutdown().await
 	};
+
+	let download = async {
+		let read_size = CONFIG.stream.buffer_size.max(4096);
+		let mut buf = BytesMut::new();
+		loop {
+			// reclaims the old allocation once the multiplexor is done with the previous chunk
+			buf.reserve(read_size);
+			if tcprx.read_buf(&mut buf).await? == 0 {
+				break;
+			}
+			muxtx
+				.send(buf.split().freeze())
+				.await
+				.map_err(std::io::Error::other)?;
+		}
+		muxtx.finish().await.map_err(std::io::Error::other)
+	};
+
+	if half_close {
+		futures_util::try_join!(upload, download)?;
+	} else {
+		select! {
+			x = upload => x?,
+			x = download => x?,
+		}
+	}
 
 	Ok(())
 }
@@ -114,6 +170,7 @@ async fn forward_stream(
 	stream: ClientStream,
 	resolved_stream: ConnectPacket,
 	uuid: Uuid,
+	half_close: bool,
 	#[cfg(feature = "twisp")] twisp_map: twisp::TwispMap,
 	#[cfg(feature = "speed-limit")] read_limit: async_speed_limit::Limiter<
 		async_speed_limit::clock::StandardClock,
@@ -126,19 +183,20 @@ async fn forward_stream(
 		ClientStream::Tcp(stream) => {
 			let closer = muxstream.get_close_handle();
 
-			let ret: anyhow::Result<()> = async {
-				copy_fast(
-					muxstream,
-					stream,
-					#[cfg(feature = "speed-limit")]
-					read_limit,
-					#[cfg(feature = "speed-limit")]
-					write_limit,
-				)
-				.await?;
-				Ok(())
-			}
-			.await;
+			let copy = copy_tcp(
+				muxstream,
+				stream,
+				half_close,
+				#[cfg(feature = "speed-limit")]
+				read_limit,
+				#[cfg(feature = "speed-limit")]
+				write_limit,
+			);
+			// a CLOSE from the client (or the multiplexor going away) aborts both directions
+			let ret = select! {
+				x = copy => x,
+				_ = closer.closed() => Ok(()),
+			};
 
 			match ret {
 				Ok(()) => {
@@ -151,8 +209,7 @@ async fn forward_stream(
 		}
 		ClientStream::Udp(stream) => {
 			let closer = muxstream.get_close_handle();
-			let (mut read, write) = muxstream.into_split();
-			let mut write = write.into_async_write().compat_write();
+			let (mut read, mut write) = muxstream.into_split();
 
 			let ret: anyhow::Result<()> = async move {
 				let mut data = vec![0u8; 65507];
@@ -160,7 +217,7 @@ async fn forward_stream(
 					select! {
 						size = stream.recv(&mut data) => {
 							let size = size?;
-							write.write_all(&data[..size]).await?;
+							write.send(Bytes::copy_from_slice(&data[..size])).await?;
 						}
 						data = read.next() => {
 							if let Some(data) = data.transpose()? {
@@ -231,6 +288,7 @@ async fn handle_stream(
 	muxstream: MuxStream<WispStreamWrite>,
 	id: String,
 	event: Arc<Event>,
+	half_close: bool,
 	#[cfg(feature = "twisp")] twisp_map: twisp::TwispMap,
 	#[cfg(feature = "speed-limit")] read_limit: async_speed_limit::Limiter<
 		async_speed_limit::clock::StandardClock,
@@ -266,6 +324,7 @@ async fn handle_stream(
 		stream,
 		resolved_stream,
 		uuid,
+		half_close,
 		#[cfg(feature = "twisp")]
 		twisp_map,
 		#[cfg(feature = "speed-limit")]
@@ -286,7 +345,11 @@ async fn handle_stream(
 	}
 }
 
-pub async fn handle_wisp(stream: WispResult, is_v2: bool, id: String) -> anyhow::Result<()> {
+pub async fn handle_wisp(
+	stream: WispResult,
+	protocol: WispClientProtocol,
+	id: String,
+) -> anyhow::Result<()> {
 	let (read, write) = stream;
 	cfg_if! {
 		if #[cfg(feature = "twisp")] {
@@ -318,22 +381,41 @@ pub async fn handle_wisp(stream: WispResult, is_v2: bool, id: String) -> anyhow:
 		.clock(async_speed_limit::clock::StandardClock)
 		.build();
 
+	let mux_result = match (protocol, extensions) {
+		(WispClientProtocol::X, Some(extensions)) => {
+			Box::pin(ServerMux::new_wispx(
+				read,
+				write,
+				WispXOptions {
+					extensions,
+					stream_window: CONFIG.wisp.wispx_stream_window,
+					max_stream_window: CONFIG.wisp.wispx_max_stream_window,
+					max_message_size: u32::try_from(CONFIG.server.max_message_size)
+						.unwrap_or(u32::MAX),
+					max_batch_size: DEFAULT_WISPX_MAX_BATCH_SIZE,
+				},
+			))
+			.await
+		}
+		(WispClientProtocol::V2, extensions) => {
+			Box::pin(ServerMux::new(read, write, buffer_size, extensions)).await
+		}
+		(WispClientProtocol::V1 | WispClientProtocol::X, _) => {
+			Box::pin(ServerMux::new(read, write, buffer_size, None)).await
+		}
+	};
 	let (mux, fut) = Box::pin(
-		Box::pin(ServerMux::new(
-			read,
-			write,
-			buffer_size,
-			if is_v2 { extensions } else { None },
-		))
-		.await
-		.context("failed to create server multiplexor")?
-		.with_required_extensions(&required_extensions),
+		mux_result
+			.context("failed to create server multiplexor")?
+			.with_required_extensions(&required_extensions),
 	)
 	.await?;
 	let mux = Arc::new(mux);
+	let half_close = mux.protocol() == WispProtocolVersion::X;
 
 	debug!(
-		"[{id}] client connected with extensions {:?}, downgraded {:?}",
+		"[{id}] client connected with protocol {:?}, extensions {:?}, downgraded {:?}",
+		mux.protocol(),
 		mux.get_extension_ids(),
 		mux.was_downgraded()
 	);
@@ -376,6 +458,7 @@ pub async fn handle_wisp(stream: WispResult, is_v2: bool, id: String) -> anyhow:
 			stream,
 			id.clone(),
 			event.clone(),
+			half_close,
 			#[cfg(feature = "twisp")]
 			twisp_map.clone(),
 			#[cfg(feature = "speed-limit")]

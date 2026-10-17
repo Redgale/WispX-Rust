@@ -28,8 +28,11 @@ pub type ClientMux<W> = Multiplexor<ClientImpl, W>;
 /// Exclusive access to the write half of the transport, from [`Multiplexor::lock_ws`].
 pub type LockedWebSocketWriteGuard<W> = futures::lock::OwnedMutexGuard<W>;
 
-/// Default per-stream receive window for WispX connections.
-pub const DEFAULT_WISPX_STREAM_WINDOW: u32 = 2 * 1024 * 1024;
+/// Default initial per-stream receive window for WispX connections.
+pub const DEFAULT_WISPX_STREAM_WINDOW: u32 = 256 * 1024;
+/// Default maximum per-stream receive window for WispX connections. Windows grow up to this
+/// while the stream's reader keeps up.
+pub const DEFAULT_WISPX_MAX_STREAM_WINDOW: u32 = 16 * 1024 * 1024;
 /// Default largest incoming websocket message for WispX connections.
 pub const DEFAULT_WISPX_MAX_MESSAGE_SIZE: u32 = 1024 * 1024;
 /// Default cap on coalesced outgoing messages for WispX connections.
@@ -105,6 +108,8 @@ pub struct WispXOptions {
 	pub extensions: WispV2Handshake,
 	/// Credit, in bytes, granted to the peer on every new flow controlled stream.
 	pub stream_window: u32,
+	/// Largest receive window a stream can grow to while its reader keeps up.
+	pub max_stream_window: u32,
 	/// Largest websocket message we accept. Must be at least 64 KiB.
 	pub max_message_size: u32,
 	/// Cap on coalesced outgoing websocket messages.
@@ -122,6 +127,7 @@ impl WispXOptions {
 		Self {
 			extensions,
 			stream_window: DEFAULT_WISPX_STREAM_WINDOW,
+			max_stream_window: DEFAULT_WISPX_MAX_STREAM_WINDOW,
 			max_message_size: DEFAULT_WISPX_MAX_MESSAGE_SIZE,
 			max_batch_size: DEFAULT_WISPX_MAX_BATCH_SIZE,
 		}
@@ -137,6 +143,7 @@ struct Handshake {
 	batch_size: usize,
 	tx_window: u64,
 	rx_window: u64,
+	rx_max_window: u64,
 	/// A message already read from the transport that the driver must process first.
 	initial: Option<Bytes>,
 	/// A frame to send before anything else (the WispX client HELLO).
@@ -156,6 +163,7 @@ impl Handshake {
 			batch_size: 0,
 			tx_window: buffer.into(),
 			rx_window: buffer.into(),
+			rx_max_window: buffer.into(),
 			initial: None,
 			first_frame: None,
 		}
@@ -165,6 +173,7 @@ impl Handshake {
 		extensions: Vec<AnyProtocolExtension>,
 		our_batch_size: usize,
 		our_stream_window: u32,
+		our_max_stream_window: u32,
 		peer_max_message_size: u32,
 		peer_stream_window: u32,
 	) -> Self {
@@ -177,6 +186,7 @@ impl Handshake {
 			batch_size: our_batch_size.clamp(X_HEADER_LEN + 1, peer_max),
 			tx_window: peer_stream_window.into(),
 			rx_window: our_stream_window.into(),
+			rx_max_window: our_max_stream_window.max(our_stream_window).into(),
 			initial: None,
 			first_frame: None,
 		}
@@ -309,6 +319,7 @@ impl<M, W: TransportWrite> Multiplexor<M, W> {
 			batch_size: handshake.batch_size,
 			tx_window: handshake.tx_window,
 			rx_window: handshake.rx_window,
+			rx_max_window: handshake.rx_max_window,
 			out_high_watermark: OUT_HIGH_WATERMARK,
 			flow_stream_types,
 		};
