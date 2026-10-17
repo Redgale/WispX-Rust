@@ -1,5 +1,5 @@
-//! In-process upload check: the original wisp-mux client sending to either the original or the
-//! new server multiplexor over an in-memory pipe. Isolates the multiplexors' receive paths.
+//! In-process upload check: the original or the new wisp-mux client sending to the original or
+//! the new server multiplexor over an in-memory pipe. Isolates the multiplexors.
 //!
 //! `inproc-upload <legacy|new> [streams] [chunk] [legacy|new client]`
 
@@ -80,19 +80,12 @@ async fn main() {
 				.new_stream(StreamType::Tcp, "a".into(), 1)
 				.await
 				.unwrap();
-			let sent = total.clone();
-			let _ = sent;
 			tokio::spawn(async move {
 				let mut w = stream.into_async_rw();
 				let buf = vec![0u8; chunk];
-				let mut n = 0u64;
 				loop {
 					w.write_all(&buf).await.unwrap();
 					w.flush().await.unwrap();
-					n += 1;
-					if n % 100 == 0 {
-						eprintln!("client wrote {n} chunks");
-					}
 				}
 			});
 		}

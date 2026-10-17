@@ -191,7 +191,7 @@ async fn handle_frame<R: TransportRead>(
 			if let Some(stream) = shared.on_data(id, payload, stream_cache) {
 				// a v1/v2 client is sending faster than the stream is read: stop reading the
 				// connection (TCP backpressure) until it catches up
-				poll_fn(|cx| shared.poll_drained(&stream, cx)).await;
+				poll_fn(|cx| MuxShared::poll_drained(&stream, cx)).await;
 			}
 		}
 		TY_CONTINUE => {

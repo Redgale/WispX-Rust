@@ -80,8 +80,7 @@ impl<W> AsyncRead for MuxStreamAsyncRead<W> {
 		cx: &mut Context<'_>,
 		bufs: &mut [io::IoSliceMut<'_>],
 	) -> Poll<io::Result<usize>> {
-		let chunk = ready!(self.as_mut().poll_fill_buf(cx))?;
-		let mut chunk = &chunk[..];
+		let mut chunk = ready!(self.as_mut().poll_fill_buf(cx))?;
 		let mut total = 0;
 		for buf in bufs {
 			if chunk.is_empty() {

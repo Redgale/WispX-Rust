@@ -28,12 +28,13 @@ use wisp_mux::{
 	packet::{CloseReason, ConnectPacket},
 	stream::MuxStream,
 	extensions::drain::DrainOnCloseProtocolExtension,
-	ServerMux, WispProtocolVersion, WispXOptions, DATA_HEADROOM, DEFAULT_WISPX_MAX_BATCH_SIZE,
+	MultiplexorActorFuture, ServerMux, WispProtocolVersion, WispV2Handshake, WispXOptions,
+	DATA_HEADROOM, DEFAULT_WISPX_MAX_BATCH_SIZE,
 };
 use wispnet::route_wispnet;
 
 use crate::{
-	route::{WispClientProtocol, WispResult, WispStreamWrite, WispWsStreamWrite},
+	route::{WispClientProtocol, WispResult, WispStreamRead, WispStreamWrite, WispWsStreamWrite},
 	stream::{ClientStream, ResolvedPacket},
 	CLIENTS, CONFIG,
 };
@@ -400,6 +401,65 @@ async fn handle_stream(
 	}
 }
 
+/// How long to hold a v1/v2 CLOSE after recent data, see `WispConfig::v2_close_delay_ms`.
+///
+/// Browsers deliver every websocket message as its own event and run the client's futures in
+/// between, so the client has read the data before it sees the CLOSE; only native clients can
+/// lose it. WispX has FIN, and the drain-on-close extension says the client keeps the data.
+fn v2_close_delay(mux: &ServerMux<WispStreamWrite>, is_browser: bool) -> Duration {
+	if mux.protocol() == WispProtocolVersion::X
+		|| is_browser
+		|| mux
+			.get_extension_ids()
+			.contains(&DrainOnCloseProtocolExtension::ID)
+	{
+		Duration::ZERO
+	} else {
+		Duration::from_millis(CONFIG.wisp.v2_close_delay_ms)
+	}
+}
+
+/// Do the handshake for the protocol the client asked for and check required extensions.
+async fn create_mux(
+	read: WispStreamRead,
+	write: WispStreamWrite,
+	protocol: WispClientProtocol,
+	extensions: Option<WispV2Handshake>,
+	required_extensions: &[u8],
+	buffer_size: u32,
+) -> anyhow::Result<(ServerMux<WispStreamWrite>, MultiplexorActorFuture)> {
+	let mux_result = match (protocol, extensions) {
+		(WispClientProtocol::X, Some(extensions)) => {
+			Box::pin(ServerMux::new_wispx(
+				read,
+				write,
+				WispXOptions {
+					extensions,
+					stream_window: CONFIG.wisp.wispx_stream_window,
+					max_stream_window: CONFIG.wisp.wispx_max_stream_window,
+					max_connection_window: CONFIG.wisp.wispx_max_connection_window,
+					max_message_size: u32::try_from(CONFIG.server.max_message_size)
+						.unwrap_or(u32::MAX),
+					max_batch_size: DEFAULT_WISPX_MAX_BATCH_SIZE,
+				},
+			))
+			.await
+		}
+		(WispClientProtocol::V2, extensions) => {
+			Box::pin(ServerMux::new(read, write, buffer_size, extensions)).await
+		}
+		(WispClientProtocol::V1 | WispClientProtocol::X, _) => {
+			Box::pin(ServerMux::new(read, write, buffer_size, None)).await
+		}
+	};
+	Ok(Box::pin(
+		mux_result
+			.context("failed to create server multiplexor")?
+			.with_required_extensions(required_extensions),
+	)
+	.await?)
+}
+
 pub async fn handle_wisp(
 	stream: WispResult,
 	protocol: WispClientProtocol,
@@ -437,51 +497,18 @@ pub async fn handle_wisp(
 		.clock(async_speed_limit::clock::StandardClock)
 		.build();
 
-	let mux_result = match (protocol, extensions) {
-		(WispClientProtocol::X, Some(extensions)) => {
-			Box::pin(ServerMux::new_wispx(
-				read,
-				write,
-				WispXOptions {
-					extensions,
-					stream_window: CONFIG.wisp.wispx_stream_window,
-					max_stream_window: CONFIG.wisp.wispx_max_stream_window,
-					max_connection_window: CONFIG.wisp.wispx_max_connection_window,
-					max_message_size: u32::try_from(CONFIG.server.max_message_size)
-						.unwrap_or(u32::MAX),
-					max_batch_size: DEFAULT_WISPX_MAX_BATCH_SIZE,
-				},
-			))
-			.await
-		}
-		(WispClientProtocol::V2, extensions) => {
-			Box::pin(ServerMux::new(read, write, buffer_size, extensions)).await
-		}
-		(WispClientProtocol::V1 | WispClientProtocol::X, _) => {
-			Box::pin(ServerMux::new(read, write, buffer_size, None)).await
-		}
-	};
-	let (mux, fut) = Box::pin(
-		mux_result
-			.context("failed to create server multiplexor")?
-			.with_required_extensions(&required_extensions),
-	)
+	let (mux, fut) = Box::pin(create_mux(
+		read,
+		write,
+		protocol,
+		extensions,
+		&required_extensions,
+		buffer_size,
+	))
 	.await?;
 	let mux = Arc::new(mux);
 	let half_close = mux.protocol() == WispProtocolVersion::X;
-	// see `WispConfig::v2_close_delay_ms`. Browsers deliver every websocket message as its own
-	// event and run the client's futures in between, so the client has read the data before it
-	// sees the CLOSE; only native clients can lose it.
-	let close_delay = if half_close
-		|| is_browser
-		|| mux
-			.get_extension_ids()
-			.contains(&DrainOnCloseProtocolExtension::ID)
-	{
-		Duration::ZERO
-	} else {
-		Duration::from_millis(CONFIG.wisp.v2_close_delay_ms)
-	};
+	let close_delay = v2_close_delay(&mux, is_browser);
 
 	debug!(
 		"[{id}] client connected with protocol {:?}, extensions {:?}, downgraded {:?}",

@@ -14,7 +14,7 @@ pub use server::ServerImpl;
 use crate::{
 	extensions::{udp::UdpProtocolExtension, AnyProtocolExtension, AnyProtocolExtensionBuilder},
 	frame::{OutFrame, Proto, TY_INFO, X_HEADER_LEN},
-	packet::{CloseReason, ConnectPacket, InfoPacket, Packet, PacketType},
+	packet::{CloseReason, InfoPacket, Packet, PacketType},
 	stream::MuxStream,
 	ws::{TransportRead, TransportWrite},
 	Role, WispError, WISPX_MIN_MESSAGE_SIZE, WISP_VERSION,
@@ -314,7 +314,7 @@ impl<M, W: TransportWrite> Multiplexor<M, W> {
 		rx: R,
 		tx: W,
 		handshake: Handshake,
-		new_streams: Option<flume::Sender<(ConnectPacket, Arc<StreamShared>)>>,
+		new_streams: Option<shared::NewStreamSender>,
 	) -> MuxResult<M, W> {
 		let flow_stream_types = handshake
 			.extensions
@@ -412,6 +412,8 @@ impl<M, W: TransportWrite> Multiplexor<M, W> {
 	/// Close all streams. Queued data is still sent first.
 	///
 	/// Also terminates the multiplexor future.
+	// async for API compatibility
+	#[allow(clippy::unused_async, unknown_lints, clippy::unused_async_trait_impl)]
 	pub async fn close(&self) -> Result<(), WispError> {
 		self.close_internal(None)
 	}
@@ -419,6 +421,8 @@ impl<M, W: TransportWrite> Multiplexor<M, W> {
 	/// Close all streams and send a close reason on stream ID 0.
 	///
 	/// Also terminates the multiplexor future.
+	// async for API compatibility
+	#[allow(clippy::unused_async, unknown_lints, clippy::unused_async_trait_impl)]
 	pub async fn close_with_reason(&self, reason: CloseReason) -> Result<(), WispError> {
 		self.close_internal(Some(reason))
 	}

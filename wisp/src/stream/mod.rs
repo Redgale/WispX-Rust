@@ -38,7 +38,7 @@ impl StreamRef {
 	}
 
 	pub fn close_reason(&self) -> Option<CloseReason> {
-		self.mux.close_reason(&self.stream)
+		MuxShared::close_reason(&self.stream)
 	}
 
 	pub fn close(&self, reason: CloseReason) -> Result<(), WispError> {
@@ -170,6 +170,8 @@ impl<W> MuxStreamWrite<W> {
 	}
 
 	/// Close the stream. You will no longer be able to write or read after this has been called.
+	// async for API compatibility
+	#[allow(clippy::unused_async, unknown_lints, clippy::unused_async_trait_impl)]
 	pub async fn close(&self, reason: CloseReason) -> Result<(), WispError> {
 		self.inner.close(reason)
 	}

@@ -1,1 +1,2 @@
 future-size-threshold = 2048
+doc-valid-idents = ["WispX", "ClientHello", ".."]

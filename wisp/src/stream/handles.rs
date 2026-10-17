@@ -2,7 +2,7 @@ use std::{future::poll_fn, marker::PhantomData};
 
 use bytes::Bytes;
 
-use crate::{packet::CloseReason, ws::PayloadRef, WispError};
+use crate::{mux::shared::MuxShared, packet::CloseReason, ws::PayloadRef, WispError};
 
 use super::StreamRef;
 
@@ -27,6 +27,8 @@ impl<W> MuxStreamCloser<W> {
 	}
 
 	/// Close the stream. You will no longer be able to write or read after this has been called.
+	// async for API compatibility
+	#[allow(clippy::unused_async, unknown_lints, clippy::unused_async_trait_impl)]
 	pub async fn close(&self, reason: CloseReason) -> Result<(), WispError> {
 		self.inner.close(reason)
 	}
@@ -39,7 +41,7 @@ impl<W> MuxStreamCloser<W> {
 	/// Wait until the stream is aborted: a CLOSE was sent or received, or the multiplexor
 	/// stopped. Graceful half-closes (FIN) do not resolve this.
 	pub async fn closed(&self) -> CloseReason {
-		poll_fn(|cx| self.inner.mux.poll_closed(&self.inner.stream, cx)).await
+		poll_fn(|cx| MuxShared::poll_closed(&self.inner.stream, cx)).await
 	}
 }
 
@@ -58,6 +60,8 @@ impl<W> MuxProtocolExtensionStream<W> {
 	}
 
 	/// Send a protocol extension packet with this stream's ID.
+	// async for API compatibility
+	#[allow(clippy::unused_async, unknown_lints, clippy::unused_async_trait_impl)]
 	pub async fn send(&mut self, packet_type: u8, data: PayloadRef<'_>) -> Result<(), WispError> {
 		let data: Bytes = data.into_owned();
 		self.inner

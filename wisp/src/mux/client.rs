@@ -190,6 +190,8 @@ impl<W: TransportWrite> Multiplexor<ClientImpl, W> {
 	}
 
 	/// Create a new stream, multiplexed through Wisp.
+	// async for API compatibility
+	#[allow(clippy::unused_async, unknown_lints, clippy::unused_async_trait_impl)]
 	///
 	/// This does not wait for the server. The CONNECT is sent together with the stream's first
 	/// data (or when it first waits to read), in the same websocket message on WispX.
@@ -235,10 +237,10 @@ const _: () = {
 		where
 			Self: 'a;
 
-		async fn connect<'a>(
-			&'a self,
+		async fn connect(
+			&self,
 			remote: std::net::SocketAddr,
-		) -> Result<Self::Connection<'a>, Self::Error> {
+		) -> Result<Self::Connection<'_>, Self::Error> {
 			let stream = self
 				.new_stream(StreamType::Tcp, remote.ip().to_string(), remote.port())
 				.await

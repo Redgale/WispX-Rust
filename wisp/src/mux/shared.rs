@@ -182,6 +182,8 @@ pub(crate) enum WriterEvent {
 }
 
 pub(crate) type StreamMap = FxHashMap<u32, Arc<StreamShared>>;
+/// Server: where accepted streams are handed to `ServerMux::wait_for_stream`.
+pub(crate) type NewStreamSender = flume::Sender<(ConnectPacket, Arc<StreamShared>)>;
 
 pub(crate) struct MuxShared {
 	pub params: MuxParams,
@@ -195,14 +197,11 @@ pub(crate) struct MuxShared {
 	rx_growth: AtomicU64,
 	/// Frames are waiting in `out`. Lets the read loop check without taking the lock.
 	out_pending: AtomicBool,
-	new_streams: Mutex<Option<flume::Sender<(ConnectPacket, Arc<StreamShared>)>>>,
+	new_streams: Mutex<Option<NewStreamSender>>,
 }
 
 impl MuxShared {
-	pub fn new(
-		params: MuxParams,
-		new_streams: Option<flume::Sender<(ConnectPacket, Arc<StreamShared>)>>,
-	) -> Self {
+	pub fn new(params: MuxParams, new_streams: Option<NewStreamSender>) -> Self {
 		Self {
 			params,
 			streams: Mutex::new(StreamMap::default()),
@@ -962,7 +961,7 @@ impl MuxShared {
 		Ok(())
 	}
 
-	pub fn close_reason(&self, stream: &StreamShared) -> Option<CloseReason> {
+	pub fn close_reason(stream: &StreamShared) -> Option<CloseReason> {
 		let state = stream.lock();
 		state
 			.closed
@@ -970,7 +969,7 @@ impl MuxShared {
 	}
 
 	/// Resolves once the stream is aborted (CLOSE sent or received, or the multiplexor died).
-	pub fn poll_closed(&self, stream: &StreamShared, cx: &mut Context<'_>) -> Poll<CloseReason> {
+	pub fn poll_closed(stream: &StreamShared, cx: &mut Context<'_>) -> Poll<CloseReason> {
 		let mut state = stream.lock();
 		if let Some(reason) = state.closed {
 			Poll::Ready(reason)
@@ -1014,7 +1013,7 @@ impl MuxShared {
 				return None;
 			}
 			if stream.flow && self.params.grants_credit() && self.params.proto == Proto::X {
-				state.rx_peer_credit -= data.len() as i64;
+				state.rx_peer_credit -= i64::try_from(data.len()).unwrap_or(i64::MAX);
 				if state.rx_peer_credit < 0 {
 					drop(state);
 					let _ = self.close_stream(&stream, CloseReason::ProtocolViolation);
@@ -1035,7 +1034,7 @@ impl MuxShared {
 	}
 
 	/// Resolves once `stream` has drained below [`V2_PAUSE_BYTES`] or closed.
-	pub fn poll_drained(&self, stream: &StreamShared, cx: &mut Context<'_>) -> Poll<()> {
+	pub fn poll_drained(stream: &StreamShared, cx: &mut Context<'_>) -> Poll<()> {
 		let mut state = stream.lock();
 		if state.rx_bytes < V2_PAUSE_BYTES || state.closed.is_some() {
 			Poll::Ready(())
