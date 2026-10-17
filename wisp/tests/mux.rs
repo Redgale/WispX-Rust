@@ -277,10 +277,11 @@ async fn x_flow_control_limits_unread_data() {
 async fn x_downstream_flow_control() {
 	const WINDOW: u32 = 64 * 1024;
 	let (client, server) = connect(Mode::X, Mode::X, WINDOW).await;
-	let _stream = client
+	let stream = client
 		.new_stream(StreamType::Tcp, "a".into(), 1)
 		.await
 		.unwrap();
+	stream.get_stream_id();
 
 	let (_, sstream) = server.wait_for_stream().await.unwrap();
 	let (_srx, mut stx) = sstream.into_split();
@@ -381,6 +382,8 @@ async fn dropping_stream_closes_it() {
 			.new_stream(StreamType::Tcp, "a".into(), 1)
 			.await
 			.unwrap();
+		// streams are announced with their first frame; this forces it
+		stream.get_stream_id();
 		let (_, mut sstream) = server.wait_for_stream().await.unwrap();
 		drop(stream);
 		let end = timeout(Duration::from_secs(5), sstream.next()).await.unwrap();
@@ -414,6 +417,7 @@ async fn closed_future_resolves_on_peer_close() {
 		.new_stream(StreamType::Tcp, "a".into(), 1)
 		.await
 		.unwrap();
+	stream.get_stream_id();
 	let (_, sstream) = server.wait_for_stream().await.unwrap();
 	let closer = sstream.get_close_handle();
 	let waiter = tokio::spawn(async move { closer.closed().await });
@@ -797,4 +801,109 @@ async fn v2_slow_reader_gets_all_data() {
 	}
 	let (received, _server) = reader.await.unwrap();
 	assert!(received == expected, "data was corrupted");
+}
+
+/// Client streams are announced with their first frame: the CONNECT and the first data share a
+/// WispX message, and a stream dropped before use never reaches the server.
+#[tokio::test]
+async fn x_connect_shares_message_with_first_data() {
+	let (c2s_tx, c2s_rx) = mpsc::unbounded::<Bytes>();
+	let (s2c_tx, s2c_rx) = mpsc::unbounded::<Bytes>();
+	let err = |_| WispError::WsImplSocketClosed;
+	let messages = Arc::new(std::sync::Mutex::new(Vec::<Bytes>::new()));
+	let seen = messages.clone();
+	let srx = c2s_rx.map(move |x: Bytes| {
+		seen.lock().unwrap().push(x.clone());
+		Ok(x)
+	});
+	let server = tokio::spawn(async move {
+		make_server(srx, s2c_tx.sink_map_err(err), Mode::X, 64 * 1024)
+			.await
+			.unwrap()
+	});
+	let client = make_client(s2c_rx.map(Ok), c2s_tx.sink_map_err(err), Mode::X, 64 * 1024)
+		.await
+		.unwrap();
+	let server = server.await.unwrap();
+
+	// opened and dropped without use: never announced
+	drop(
+		client
+			.new_stream(StreamType::Tcp, "unused".into(), 1)
+			.await
+			.unwrap(),
+	);
+
+	let mut stream = client
+		.new_stream(StreamType::Tcp, "used".into(), 1)
+		.await
+		.unwrap();
+	stream.send(Bytes::from_static(b"hello")).await.unwrap();
+
+	let (connect, mut sstream) = server.wait_for_stream().await.unwrap();
+	assert_eq!(connect.host, "used");
+	assert_eq!(&sstream.next().await.unwrap().unwrap()[..], b"hello");
+
+	// [client HELLO], then one message holding CONNECT + DATA
+	let messages = messages.lock().unwrap().clone();
+	let with_connect: Vec<_> = messages.iter().filter(|x| x.contains(&b'u')).collect();
+	assert_eq!(with_connect.len(), 1, "CONNECT went out alone");
+	let msg = with_connect[0];
+	assert_eq!(msg[0], 0x01, "first frame is CONNECT");
+	assert!(msg.windows(5).any(|x| x == b"hello"), "first data is in the same message");
+	assert!(!messages.iter().any(|x| x.windows(6).any(|w| w == b"unused")));
+}
+
+#[tokio::test]
+async fn send_last_with_headroom_delivers_data_then_end() {
+	use bytes::BufMut;
+	for mode in [Mode::X, Mode::V2, Mode::V1] {
+		let (client, server) = connect(mode, mode, 64 * 1024).await;
+		let mut stream = client
+			.new_stream(StreamType::Tcp, "a".into(), 1)
+			.await
+			.unwrap();
+		stream.send(Bytes::from_static(b"request")).await.unwrap();
+
+		let (_, sstream) = server.wait_for_stream().await.unwrap();
+		let sender = tokio::spawn(async move {
+			let (mut srx, mut stx) = sstream.into_split();
+			assert_eq!(&srx.next().await.unwrap().unwrap()[..], b"request");
+			for size in [10usize, 100_000] {
+				let mut buf = BytesMut::new();
+				buf.put_bytes(0, wisp_mux::DATA_HEADROOM);
+				buf.extend_from_slice(&pattern(size, 4));
+				if size == 10 {
+					stx.send_with_headroom(buf).await.unwrap();
+				} else {
+					// bigger than the 64 KiB window: falls back to a normal send, then finishes
+					stx.send_last_with_headroom(buf).await.unwrap();
+				}
+			}
+		});
+
+		let mut received = Vec::new();
+		while let Some(chunk) = stream.next().await {
+			received.extend_from_slice(&chunk.unwrap());
+		}
+		sender.await.unwrap();
+		assert_eq!(received.len(), 100_010, "{mode:?}");
+		assert_eq!(stream.get_close_reason(), Some(CloseReason::Voluntary), "{mode:?}");
+
+		// the small case, where data and FIN share a write
+		let mut stream = client
+			.new_stream(StreamType::Tcp, "a".into(), 1)
+			.await
+			.unwrap();
+		stream.send(Bytes::from_static(b"x")).await.unwrap();
+		let (_, mut sstream) = server.wait_for_stream().await.unwrap();
+		sstream.next().await.unwrap().unwrap();
+		let (_, mut stx) = sstream.into_split();
+		let mut buf = BytesMut::new();
+		buf.put_bytes(0, wisp_mux::DATA_HEADROOM);
+		buf.extend_from_slice(b"last");
+		stx.send_last_with_headroom(buf).await.unwrap();
+		assert_eq!(&stream.next().await.unwrap().unwrap()[..], b"last");
+		assert!(stream.next().await.is_none(), "{mode:?}");
+	}
 }

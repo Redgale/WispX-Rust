@@ -6,6 +6,7 @@ use std::{
 	task::{ready, Context, Poll},
 };
 
+use bytes::BytesMut;
 use futures::{Sink, Stream};
 
 use crate::{
@@ -33,7 +34,7 @@ impl StreamRef {
 	}
 
 	pub fn id(&self) -> u32 {
-		self.stream.id
+		self.mux.ensure_open(&self.stream)
 	}
 
 	pub fn close_reason(&self) -> Option<CloseReason> {
@@ -171,6 +172,51 @@ impl<W> MuxStreamWrite<W> {
 	/// Close the stream. You will no longer be able to write or read after this has been called.
 	pub async fn close(&self, reason: CloseReason) -> Result<(), WispError> {
 		self.inner.close(reason)
+	}
+
+	/// Send a buffer whose first [`DATA_HEADROOM`](crate::DATA_HEADROOM) bytes are scratch space.
+	/// The frame header is written there, so the data is sent without being copied. Useful when
+	/// reading into a buffer anyway:
+	///
+	/// ```ignore
+	/// buf.put_bytes(0, wisp_mux::DATA_HEADROOM);
+	/// socket.read_buf(&mut buf).await?;
+	/// stream.send_with_headroom(buf.split()).await?;
+	/// ```
+	pub async fn send_with_headroom(&mut self, data: BytesMut) -> Result<(), WispError> {
+		if data.len() < crate::DATA_HEADROOM {
+			return Err(WispError::PacketTooSmall);
+		}
+		poll_fn(|cx| self.inner.poll_send_all(cx, &mut self.pending)).await?;
+		poll_fn(|cx| self.inner.mux.poll_send_ready(&self.inner.stream, cx)).await?;
+		let rest = self
+			.inner
+			.mux
+			.send_data_with_headroom(&self.inner.stream, data)?;
+		if !rest.is_empty() {
+			self.pending = Some(rest);
+		}
+		poll_fn(|cx| self.inner.poll_send_all(cx, &mut self.pending)).await
+	}
+
+	/// [`Self::send_with_headroom`] followed by [`Self::finish`], with the data and the FIN (or
+	/// CLOSE on v1/v2) leaving in the same write whenever credit allows.
+	pub async fn send_last_with_headroom(&mut self, data: BytesMut) -> Result<(), WispError> {
+		if data.len() < crate::DATA_HEADROOM {
+			return Err(WispError::PacketTooSmall);
+		}
+		poll_fn(|cx| self.inner.poll_send_all(cx, &mut self.pending)).await?;
+		match self
+			.inner
+			.mux
+			.send_last_with_headroom(&self.inner.stream, data)?
+		{
+			None => Ok(()),
+			Some(data) => {
+				self.send_with_headroom(data).await?;
+				self.inner.finish()
+			}
+		}
 	}
 
 	/// Half-close the stream: send any buffered data, then tell the peer no more data is coming.

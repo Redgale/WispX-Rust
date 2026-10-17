@@ -345,6 +345,9 @@ struct Report {
 	mib_per_sec: Option<f64>,
 	/// upload: what the client wrote, which exceeds `mib_per_sec` if data was lost
 	upload_written_mib_per_sec: Option<f64>,
+	/// upload: fraction of everything written that never arrived, after letting data in flight
+	/// drain
+	upload_lost_fraction: Option<f64>,
 	/// rr round trips/s, churn streams/s
 	ops_per_sec: Option<f64>,
 	p50_ms: Option<f64>,
@@ -521,6 +524,20 @@ async fn run_load(cli: &Cli, url: &Uri, report: &mut Report) -> Result<()> {
 		.zip(process_cpu_seconds(std::process::id()))
 		.map(|(a, b)| b - a);
 	shared.stop.store(true, Ordering::Relaxed);
+	if let Workload::Upload = cli.workload {
+		// wait for data in flight to arrive, then compare totals
+		let mut last = SINK_RECEIVED.load(Ordering::Relaxed);
+		for _ in 0..30 {
+			tokio::time::sleep(Duration::from_millis(300)).await;
+			let now = SINK_RECEIVED.load(Ordering::Relaxed);
+			if now == last {
+				break;
+			}
+			last = now;
+		}
+		let written = shared.bytes.load(Ordering::Relaxed);
+		report.upload_lost_fraction = Some(1.0 - last as f64 / written.max(1) as f64);
+	}
 	// rr/churn workers stop at the next operation and hand in their latencies
 	let _ = tokio::time::timeout(Duration::from_millis(500), async {
 		for task in &mut tasks {
@@ -580,11 +597,14 @@ async fn worker(
 			Workload::Upload => {
 				let mut stream = client.open(target).await?;
 				let buf = vec![0u8; size];
-				loop {
+				while !shared.stop.load(Ordering::Relaxed) {
 					stream.write_all(&buf).await?;
 					stream.flush().await?;
 					shared.bytes.fetch_add(size as u64, Ordering::Relaxed);
 				}
+				// keep the stream open while the rest drains to the target
+				std::future::pending::<()>().await;
+				Ok(())
 			}
 			Workload::Rr => {
 				let mut stream = client.open(target).await?;
@@ -670,6 +690,9 @@ fn print_report(r: &Report) {
 	}
 	if let Some(x) = r.upload_written_mib_per_sec {
 		println!("  written by client: {x:.1} MiB/s");
+	}
+	if let Some(x) = r.upload_lost_fraction {
+		println!("  never arrived: {:.2}% of all data written", x * 100.0);
 	}
 	if let Some(x) = r.ops_per_sec {
 		println!(

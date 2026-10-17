@@ -5,11 +5,11 @@ use std::{
 	task::{ready, Context, Poll},
 };
 
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use futures::{AsyncBufRead, AsyncRead, AsyncWrite};
 use pin_project::pin_project;
 
-use crate::{packet::CloseReason, ws::Payload, WispError};
+use crate::{packet::CloseReason, ws::Payload, WispError, DATA_HEADROOM};
 
 use super::{MuxStream, MuxStreamRead, MuxStreamWrite, StreamRef};
 
@@ -135,11 +135,13 @@ impl<W> MuxStreamAsyncWrite<W> {
 		self.inner.close_reason()
 	}
 
+	/// Copy up to `len` bytes (via `copy`) into a frame buffer with headroom, so this copy is
+	/// the only one: the writer sends the buffer as-is.
 	fn poll_write_with(
 		&mut self,
 		cx: &mut Context<'_>,
 		len: usize,
-		copy: impl FnOnce(usize) -> Bytes,
+		copy: impl FnOnce(&mut BytesMut, usize),
 	) -> Poll<io::Result<usize>> {
 		if len == 0 {
 			return Poll::Ready(Ok(0));
@@ -149,7 +151,12 @@ impl<W> MuxStreamAsyncWrite<W> {
 		ready!(mux.poll_send_ready(stream, cx)).map_err(to_io)?;
 
 		let len = len.min(mux.send_limit(stream));
-		let rest = mux.send_data(stream, copy(len)).map_err(to_io)?;
+		let mut buf = BytesMut::with_capacity(DATA_HEADROOM + len);
+		buf.put_bytes(0, DATA_HEADROOM);
+		copy(&mut buf, len);
+		let rest = mux
+			.send_data_with_headroom(stream, buf)
+			.map_err(to_io)?;
 		debug_assert!(rest.is_empty());
 		Poll::Ready(Ok(len))
 	}
@@ -162,7 +169,7 @@ impl<W> AsyncWrite for MuxStreamAsyncWrite<W> {
 		buf: &[u8],
 	) -> Poll<io::Result<usize>> {
 		self.get_mut()
-			.poll_write_with(cx, buf.len(), |len| Bytes::copy_from_slice(&buf[..len]))
+			.poll_write_with(cx, buf.len(), |out, len| out.extend_from_slice(&buf[..len]))
 	}
 
 	fn poll_write_vectored(
@@ -171,16 +178,16 @@ impl<W> AsyncWrite for MuxStreamAsyncWrite<W> {
 		bufs: &[io::IoSlice<'_>],
 	) -> Poll<io::Result<usize>> {
 		let total = bufs.iter().map(|x| x.len()).sum();
-		self.get_mut().poll_write_with(cx, total, |len| {
-			let mut out = BytesMut::with_capacity(len);
+		self.get_mut().poll_write_with(cx, total, |out, len| {
+			let mut remaining = len;
 			for buf in bufs {
-				let remaining = len - out.len();
 				if remaining == 0 {
 					break;
 				}
-				out.extend_from_slice(&buf[..buf.len().min(remaining)]);
+				let take = buf.len().min(remaining);
+				out.extend_from_slice(&buf[..take]);
+				remaining -= take;
 			}
-			out.freeze()
 		})
 	}
 

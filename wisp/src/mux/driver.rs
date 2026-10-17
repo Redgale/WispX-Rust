@@ -22,7 +22,7 @@ use crate::{
 	Role, WispError,
 };
 
-use super::shared::{MuxShared, WriterEvent};
+use super::shared::{MuxShared, StreamShared, WriterEvent};
 
 /// Stop pulling more frames into one flush after this many bytes, so a busy connection still
 /// flushes regularly.
@@ -134,6 +134,7 @@ async fn read_loop<R: TransportRead>(
 	let proto = shared.params.proto;
 	let mut frames = Vec::new();
 	let mut last_connect_id = 0u32;
+	let mut stream_cache = None;
 
 	let mut next = initial;
 	loop {
@@ -151,6 +152,7 @@ async fn read_loop<R: TransportRead>(
 				&shared,
 				frame,
 				&mut last_connect_id,
+				&mut stream_cache,
 				&mut extensions,
 				&mut rx,
 			)
@@ -172,6 +174,7 @@ async fn handle_frame<R: TransportRead>(
 	shared: &Arc<MuxShared>,
 	frame: InFrame,
 	last_connect_id: &mut u32,
+	stream_cache: &mut Option<Arc<StreamShared>>,
 	extensions: &mut [AnyProtocolExtension],
 	rx: &mut R,
 ) -> Result<bool, WispError> {
@@ -184,7 +187,7 @@ async fn handle_frame<R: TransportRead>(
 
 	match ty {
 		TY_DATA => {
-			if let Some(stream) = shared.on_data(id, payload) {
+			if let Some(stream) = shared.on_data(id, payload, stream_cache) {
 				// a v1/v2 client is sending faster than the stream is read: stop reading the
 				// connection (TCP backpressure) until it catches up
 				poll_fn(|cx| shared.poll_drained(&stream, cx)).await;

@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use wisp_mux::{
 	extensions::{
 		cert::{CertAuthProtocolExtension, CertAuthProtocolExtensionBuilder},
+		drain::DrainOnCloseProtocolExtensionBuilder,
 		motd::MotdProtocolExtensionBuilder,
 		password::{PasswordProtocolExtension, PasswordProtocolExtensionBuilder},
 		udp::UdpProtocolExtensionBuilder,
@@ -178,12 +179,19 @@ pub struct WispConfig {
 	/// WispX: a stream's window grows up to this while the destination keeps up with the
 	/// client's uploads.
 	pub wispx_max_stream_window: u32,
+	/// WispX: limit on window growth summed over all streams of one connection, which bounds
+	/// how much upload data one client can make the server buffer.
+	pub wispx_max_connection_window: u64,
 	/// Wisp v1/v2: after a destination closes its side, wait this long before sending CLOSE.
 	///
 	/// v1/v2 have no half-close, so a finished response is followed by a CLOSE. The original
 	/// wisp-mux client (epoxy-tls 2.x) discards received data it hasn't read yet when a CLOSE
 	/// arrives, which truncates responses whose last data and CLOSE arrive together. A short
-	/// delay lets clients read the data first. WispX uses FIN instead and isn't affected.
+	/// delay lets clients read the data first. Only applies when data was sent within the
+	/// delay, and not to browsers (connections with an `Origin` header: a browser dispatches each
+	/// websocket message as its own event and the client reads the data before it sees the
+	/// CLOSE), to clients that send the drain-on-close extension (the new wisp-mux), or to
+	/// WispX.
 	pub v2_close_delay_ms: u64,
 	/// Wisp version 2 extensions advertised.
 	pub extensions: Vec<ProtocolExtension>,
@@ -383,8 +391,9 @@ impl Default for WispConfig {
 			wisp_v2: true,
 			wispx: true,
 			wispx_stream_window: 256 * 1024,
-			wispx_max_stream_window: 16 * 1024 * 1024,
-			v2_close_delay_ms: 20,
+			wispx_max_stream_window: 64 * 1024 * 1024,
+			wispx_max_connection_window: 256 * 1024 * 1024,
+			v2_close_delay_ms: 2,
 			extensions: vec![ProtocolExtension::Udp, ProtocolExtension::Motd],
 			auth_extension: None,
 
@@ -409,6 +418,10 @@ impl WispConfig {
 		if self.wisp_v2 {
 			let mut extensions: Vec<AnyProtocolExtensionBuilder> = Vec::new();
 			let mut required_extensions: Vec<u8> = Vec::new();
+
+			extensions.push(AnyProtocolExtensionBuilder::new(
+				DrainOnCloseProtocolExtensionBuilder,
+			));
 
 			if self.extensions.contains(&ProtocolExtension::Udp) {
 				extensions.push(AnyProtocolExtensionBuilder::new(

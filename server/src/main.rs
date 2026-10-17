@@ -363,9 +363,11 @@ fn handle_stream(stream: ServerRouteResult, id: String) {
 			(Mutex::new(HashMap::new()), format!("{stream}")),
 		);
 		let res = match stream {
-			ServerRouteResult::Wisp { stream, protocol } => {
-				Box::pin(handle_wisp(stream, protocol, id.clone())).await
-			}
+			ServerRouteResult::Wisp {
+				stream,
+				protocol,
+				is_browser,
+			} => Box::pin(handle_wisp(stream, protocol, is_browser, id.clone())).await,
 			ServerRouteResult::Wispnet { stream } => {
 				Box::pin(handle_wispnet(stream, id.clone())).await
 			}

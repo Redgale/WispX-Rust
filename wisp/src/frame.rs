@@ -29,6 +29,16 @@ pub(crate) const X_HEADER_LEN: usize = 9;
 /// Every WispX peer must accept messages of at least this size.
 pub const WISPX_MIN_MESSAGE_SIZE: u32 = 64 * 1024;
 
+/// Bytes reserved in front of a data buffer so the frame header can be written in place,
+/// letting the buffer be sent without copying. See [`MuxStreamWrite::send_with_headroom`].
+///
+/// [`MuxStreamWrite::send_with_headroom`]: crate::stream::MuxStreamWrite::send_with_headroom
+pub const DATA_HEADROOM: usize = X_HEADER_LEN;
+
+/// Frames at least this big that have headroom are sent as their own message without copying.
+/// Smaller ones are copied into the current batch, which is cheaper than an extra message.
+const ZERO_COPY_MIN: usize = 2048;
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum Proto {
 	V1,
@@ -48,6 +58,8 @@ impl Proto {
 #[derive(Debug)]
 pub(crate) enum OutPayload {
 	Bytes(Bytes),
+	/// Payload after [`DATA_HEADROOM`] scratch bytes.
+	Headroom(BytesMut),
 	U32(u32),
 	U8(u8),
 	Empty,
@@ -67,6 +79,16 @@ impl OutFrame {
 			ty: TY_DATA,
 			id,
 			payload: OutPayload::Bytes(data),
+		}
+	}
+
+	/// DATA whose buffer starts with [`DATA_HEADROOM`] scratch bytes.
+	pub fn data_with_headroom(id: u32, data: BytesMut) -> Self {
+		debug_assert!(data.len() >= DATA_HEADROOM);
+		Self {
+			ty: TY_DATA,
+			id,
+			payload: OutPayload::Headroom(data),
 		}
 	}
 
@@ -118,6 +140,7 @@ impl OutFrame {
 	pub fn payload_len(&self) -> usize {
 		match &self.payload {
 			OutPayload::Bytes(x) => x.len(),
+			OutPayload::Headroom(x) => x.len() - DATA_HEADROOM,
 			OutPayload::U32(_) => 4,
 			OutPayload::U8(_) => 1,
 			OutPayload::Empty => 0,
@@ -130,18 +153,33 @@ impl OutFrame {
 	}
 
 	fn encode_into(&self, proto: Proto, buf: &mut BytesMut) {
-		buf.put_u8(self.ty);
-		buf.put_u32_le(self.id);
-		if proto == Proto::X {
-			#[expect(clippy::cast_possible_truncation)]
-			buf.put_u32_le(self.payload_len() as u32);
-		}
+		put_header(buf, proto, self.ty, self.id, self.payload_len());
 		match &self.payload {
 			OutPayload::Bytes(x) => buf.extend_from_slice(x),
+			OutPayload::Headroom(x) => buf.extend_from_slice(&x[DATA_HEADROOM..]),
 			OutPayload::U32(x) => buf.put_u32_le(*x),
 			OutPayload::U8(x) => buf.put_u8(*x),
 			OutPayload::Empty => {}
 		}
+	}
+
+	/// Write the header into the headroom and return the frame as one message, without copying
+	/// the payload. The result is the only reference to its buffer, so a websocket client can
+	/// mask it in place.
+	fn encode_in_place(self, proto: Proto) -> Bytes {
+		let OutPayload::Headroom(mut buf) = self.payload else {
+			unreachable!("encode_in_place without headroom");
+		};
+		let offset = DATA_HEADROOM - proto.header_len();
+		let len = buf.len() - DATA_HEADROOM;
+		put_header(&mut &mut buf[offset..DATA_HEADROOM], proto, self.ty, self.id, len);
+		let mut bytes = buf.freeze();
+		bytes.advance(offset);
+		bytes
+	}
+
+	fn is_zero_copy(&self) -> bool {
+		matches!(&self.payload, OutPayload::Headroom(x) if x.len() - DATA_HEADROOM >= ZERO_COPY_MIN)
 	}
 
 	/// Encode this frame as a standalone websocket message.
@@ -149,6 +187,15 @@ impl OutFrame {
 		let mut buf = BytesMut::with_capacity(proto.header_len() + self.payload_len());
 		self.encode_into(proto, &mut buf);
 		buf.freeze()
+	}
+}
+
+fn put_header(buf: &mut impl BufMut, proto: Proto, ty: u8, id: u32, len: usize) {
+	buf.put_u8(ty);
+	buf.put_u32_le(id);
+	if proto == Proto::X {
+		#[expect(clippy::cast_possible_truncation)]
+		buf.put_u32_le(len as u32);
 	}
 }
 
@@ -164,28 +211,38 @@ pub(crate) fn encode_batch(
 	out: &mut Vec<Bytes>,
 ) {
 	let header = proto.header_len();
-	let total: usize = frames.iter().map(|x| header + x.payload_len()).sum();
+	let total: usize = frames
+		.iter()
+		.filter(|x| !x.is_zero_copy())
+		.map(|x| header + x.payload_len())
+		.sum();
 	let mut buf = BytesMut::with_capacity(total);
 
-	match proto {
-		Proto::V1 | Proto::V2 => {
-			for frame in frames.drain(..) {
+	for frame in frames.drain(..) {
+		if frame.is_zero_copy() {
+			// keep message order: whatever is batched so far goes first
+			if !buf.is_empty() {
+				out.push(buf.split().freeze());
+			}
+			out.push(frame.encode_in_place(proto));
+			continue;
+		}
+		match proto {
+			Proto::V1 | Proto::V2 => {
 				frame.encode_into(proto, &mut buf);
 				out.push(buf.split().freeze());
 			}
-		}
-		Proto::X => {
-			for frame in frames.drain(..) {
+			Proto::X => {
 				let len = header + frame.payload_len();
 				if !buf.is_empty() && buf.len() + len > batch_size {
 					out.push(buf.split().freeze());
 				}
 				frame.encode_into(proto, &mut buf);
 			}
-			if !buf.is_empty() {
-				out.push(buf.freeze());
-			}
 		}
+	}
+	if !buf.is_empty() {
+		out.push(buf.freeze());
 	}
 }
 
@@ -321,6 +378,45 @@ mod tests {
 		assert_eq!(out.len(), 2);
 		assert_eq!(&out[0][..], &[0x02, 1, 0, 0, 0, b'a', b'b', b'c']);
 		assert_eq!(&out[1][..], &[0x03, 1, 0, 0, 0, 7, 0, 0, 0]);
+	}
+
+	fn headroom(payload: &[u8]) -> BytesMut {
+		let mut buf = BytesMut::new();
+		buf.put_bytes(0, DATA_HEADROOM);
+		buf.extend_from_slice(payload);
+		buf
+	}
+
+	#[test]
+	fn headroom_frames_are_not_copied() {
+		for proto in [Proto::X, Proto::V2] {
+			let big = vec![7u8; 10_000];
+			let buf = headroom(&big);
+			let payload_ptr = buf[DATA_HEADROOM..].as_ptr();
+			let mut frames: VecDeque<_> = vec![
+				OutFrame::credit(1, 5),
+				OutFrame::data_with_headroom(2, buf),
+				OutFrame::data_with_headroom(3, headroom(b"small")),
+			]
+			.into();
+			let mut out = Vec::new();
+			encode_batch(proto, &mut frames, 64 * 1024, &mut out);
+			// the big frame is its own message and points at the original buffer
+			let big_msg = out
+				.iter()
+				.find(|x| x.len() == proto.header_len() + big.len())
+				.unwrap();
+			assert_eq!(big_msg[proto.header_len()..].as_ptr(), payload_ptr);
+
+			let mut decoded = Vec::new();
+			for msg in out {
+				decode_message(proto, msg, &mut decoded).unwrap();
+			}
+			assert_eq!(decoded.len(), 3);
+			assert_eq!(decoded[0].ty, TY_CONTINUE);
+			assert_eq!((decoded[1].id, decoded[1].payload.len()), (2, 10_000));
+			assert_eq!(&decoded[2].payload[..], b"small");
+		}
 	}
 
 	#[test]

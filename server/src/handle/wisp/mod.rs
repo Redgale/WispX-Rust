@@ -11,7 +11,7 @@ use std::{
 };
 
 use anyhow::Context;
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use cfg_if::cfg_if;
 use event_listener::Event;
 use futures_util::{future::Either, FutureExt, SinkExt, StreamExt};
@@ -27,7 +27,8 @@ use uuid::Uuid;
 use wisp_mux::{
 	packet::{CloseReason, ConnectPacket},
 	stream::MuxStream,
-	ServerMux, WispProtocolVersion, WispXOptions, DEFAULT_WISPX_MAX_BATCH_SIZE,
+	extensions::drain::DrainOnCloseProtocolExtension,
+	ServerMux, WispProtocolVersion, WispXOptions, DATA_HEADROOM, DEFAULT_WISPX_MAX_BATCH_SIZE,
 };
 use wispnet::route_wispnet;
 
@@ -36,6 +37,27 @@ use crate::{
 	stream::{ClientStream, ResolvedPacket},
 	CLIENTS, CONFIG,
 };
+
+/// Without waiting, read whatever else is already available into `buf`'s spare capacity.
+/// Returns true if the destination has closed its side.
+#[cfg(not(feature = "speed-limit"))]
+fn read_ready(tcprx: &tokio::net::tcp::OwnedReadHalf, buf: &mut BytesMut) -> std::io::Result<bool> {
+	while buf.len() < buf.capacity() {
+		match tcprx.try_read_buf(buf) {
+			Ok(0) => return Ok(true),
+			Ok(_) => {}
+			Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => return Ok(false),
+			Err(err) => return Err(err),
+		}
+	}
+	Ok(false)
+}
+
+/// The rate limiter wraps the socket, so there's no non-blocking read to peek with.
+#[cfg(feature = "speed-limit")]
+fn read_ready<R>(_: &R, _: &mut BytesMut) -> std::io::Result<bool> {
+	Ok(false)
+}
 
 /// Relay a Wisp stream and a TCP socket until both directions are done.
 ///
@@ -47,6 +69,7 @@ async fn copy_tcp(
 	mux: MuxStream<WispStreamWrite>,
 	tcp: TcpStream,
 	half_close: bool,
+	close_delay: Duration,
 	#[cfg(feature = "speed-limit")] read_limit: async_speed_limit::Limiter<
 		async_speed_limit::clock::StandardClock,
 	>,
@@ -100,21 +123,37 @@ async fn copy_tcp(
 		let mut buf = BytesMut::new();
 		let mut last_send = None;
 		loop {
-			// reclaims the old allocation once the multiplexor is done with the previous chunk
-			buf.reserve(read_size);
+			// read after DATA_HEADROOM scratch bytes, so the frame header can be written in
+			// front and the data goes out without being copied
+			buf.reserve(DATA_HEADROOM + read_size);
+			buf.put_bytes(0, DATA_HEADROOM);
 			if tcprx.read_buf(&mut buf).await? == 0 {
 				break;
 			}
+			let eof = read_ready(&tcprx, &mut buf)?;
+			if eof && close_delay.is_zero() {
+				// the destination is done: the last data and the FIN/CLOSE share one write
+				return muxtx
+					.send_last_with_headroom(buf.split())
+					.await
+					.map_err(std::io::Error::other);
+			}
 			muxtx
-				.send(buf.split().freeze())
+				.send_with_headroom(buf.split())
 				.await
 				.map_err(std::io::Error::other)?;
 			last_send = Some(Instant::now());
+			if eof {
+				break;
+			}
 		}
 		// see `WispConfig::v2_close_delay_ms`: only data sent shortly before is at risk
 		if let (false, Some(last_send)) = (half_close, last_send) {
-			let delay = Duration::from_millis(CONFIG.wisp.v2_close_delay_ms);
-			tokio::time::sleep(delay.saturating_sub(last_send.elapsed())).await;
+			// even a zero sleep waits for the next (1 ms) timer tick
+			let remaining = close_delay.saturating_sub(last_send.elapsed());
+			if !remaining.is_zero() {
+				tokio::time::sleep(remaining).await;
+			}
 		}
 		muxtx.finish().await.map_err(std::io::Error::other)
 	};
@@ -183,6 +222,7 @@ async fn forward_stream(
 	resolved_stream: ConnectPacket,
 	uuid: Uuid,
 	half_close: bool,
+	close_delay: Duration,
 	#[cfg(feature = "twisp")] twisp_map: twisp::TwispMap,
 	#[cfg(feature = "speed-limit")] read_limit: async_speed_limit::Limiter<
 		async_speed_limit::clock::StandardClock,
@@ -199,6 +239,7 @@ async fn forward_stream(
 				muxstream,
 				stream,
 				half_close,
+				close_delay,
 				#[cfg(feature = "speed-limit")]
 				read_limit,
 				#[cfg(feature = "speed-limit")]
@@ -301,6 +342,7 @@ async fn handle_stream(
 	id: String,
 	event: Arc<Event>,
 	half_close: bool,
+	close_delay: Duration,
 	#[cfg(feature = "twisp")] twisp_map: twisp::TwispMap,
 	#[cfg(feature = "speed-limit")] read_limit: async_speed_limit::Limiter<
 		async_speed_limit::clock::StandardClock,
@@ -337,6 +379,7 @@ async fn handle_stream(
 		resolved_stream,
 		uuid,
 		half_close,
+		close_delay,
 		#[cfg(feature = "twisp")]
 		twisp_map,
 		#[cfg(feature = "speed-limit")]
@@ -360,6 +403,7 @@ async fn handle_stream(
 pub async fn handle_wisp(
 	stream: WispResult,
 	protocol: WispClientProtocol,
+	is_browser: bool,
 	id: String,
 ) -> anyhow::Result<()> {
 	let (read, write) = stream;
@@ -402,6 +446,7 @@ pub async fn handle_wisp(
 					extensions,
 					stream_window: CONFIG.wisp.wispx_stream_window,
 					max_stream_window: CONFIG.wisp.wispx_max_stream_window,
+					max_connection_window: CONFIG.wisp.wispx_max_connection_window,
 					max_message_size: u32::try_from(CONFIG.server.max_message_size)
 						.unwrap_or(u32::MAX),
 					max_batch_size: DEFAULT_WISPX_MAX_BATCH_SIZE,
@@ -424,6 +469,19 @@ pub async fn handle_wisp(
 	.await?;
 	let mux = Arc::new(mux);
 	let half_close = mux.protocol() == WispProtocolVersion::X;
+	// see `WispConfig::v2_close_delay_ms`. Browsers deliver every websocket message as its own
+	// event and run the client's futures in between, so the client has read the data before it
+	// sees the CLOSE; only native clients can lose it.
+	let close_delay = if half_close
+		|| is_browser
+		|| mux
+			.get_extension_ids()
+			.contains(&DrainOnCloseProtocolExtension::ID)
+	{
+		Duration::ZERO
+	} else {
+		Duration::from_millis(CONFIG.wisp.v2_close_delay_ms)
+	};
 
 	debug!(
 		"[{id}] client connected with protocol {:?}, extensions {:?}, downgraded {:?}",
@@ -471,6 +529,7 @@ pub async fn handle_wisp(
 			id.clone(),
 			event.clone(),
 			half_close,
+			close_delay,
 			#[cfg(feature = "twisp")]
 			twisp_map.clone(),
 			#[cfg(feature = "speed-limit")]

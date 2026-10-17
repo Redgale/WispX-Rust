@@ -40,6 +40,10 @@ def main():
             p50 = [r["p50_ms"] for r in reports if r.get("p50_ms") is not None]
             p99 = [r["p99_ms"] for r in reports if r.get("p99_ms") is not None]
             errors = sum(r.get("errors", 0) for r in reports) + sum(1 for r in reports if "failed" in r)
+            lost = [r["upload_lost_fraction"] for r in reports if r.get("upload_lost_fraction") is not None]
+            loss = statistics.median(lost) if lost else None
+            truncated = sum(r.get("truncated", 0) for r in reports)
+            seconds = sum(r.get("seconds", 0) for r in reports)
             unit, higher = next((metric(r)[1:] for r in reports if metric(r)[0] is not None), ("", True))
             medians[config] = {
                 "value": statistics.median(values) if values else None,
@@ -50,12 +54,15 @@ def main():
                 "unit": unit,
                 "higher": higher,
                 "protocol": reports[-1].get("protocol", ""),
+                "loss": loss,
+                "truncated_per_sec": truncated / seconds if seconds else 0,
             }
 
         base = medians.get(BASELINES["v2"], {}).get("value")
         print(f"\n### {workload}\n")
         has_lat = any(m["p50"] is not None for m in medians.values())
         has_cpu = any(m["cpu"] is not None for m in medians.values())
+        has_integrity = any(m["loss"] is not None or m["truncated_per_sec"] for m in medians.values())
         header = "| setup | result | vs baseline v2 |"
         sep = "|---|---:|---:|"
         if has_lat:
@@ -64,6 +71,9 @@ def main():
         if has_cpu:
             header += " server CPU per unit |"
             sep += "---:|"
+        if has_integrity:
+            header += " data integrity |"
+            sep += "---|"
         print(header)
         print(sep)
         for config, m in medians.items():
@@ -82,6 +92,13 @@ def main():
             if has_cpu:
                 unit = "ms/GiB" if m["unit"] == "MiB/s" else "ms/1k ops"
                 line += f" {m['cpu']:.0f} {unit} |" if m["cpu"] is not None else " |"
+            if has_integrity:
+                if m["loss"] is not None and m["loss"] > 0.0001:
+                    line += f" **{100 * m['loss']:.0f}% of uploaded data lost** |"
+                elif m["truncated_per_sec"]:
+                    line += f" **{m['truncated_per_sec']:.0f} truncated responses/s** |"
+                else:
+                    line += " ok |"
             if m["errors"]:
                 line += f" errors: {m['errors']}"
             print(line)

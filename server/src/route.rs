@@ -5,7 +5,8 @@ use bytes::Bytes;
 use futures_util::future::Either;
 use http_body_util::Full;
 use hyper::{
-	body::Incoming, header::SEC_WEBSOCKET_PROTOCOL, server::conn::http1::Builder,
+	body::Incoming,
+	header::{ORIGIN, SEC_WEBSOCKET_PROTOCOL}, server::conn::http1::Builder,
 	header::HeaderValue, service::service_fn, upgrade::OnUpgrade, HeaderMap, Request, Response,
 	StatusCode,
 };
@@ -54,6 +55,8 @@ pub enum ServerRouteResult {
 	Wisp {
 		stream: WispResult,
 		protocol: WispClientProtocol,
+		/// The upgrade request had an `Origin` header, which browsers always send.
+		is_browser: bool,
 	},
 	Wispnet {
 		stream: WispResult,
@@ -110,6 +113,7 @@ enum HttpUpgradeResult {
 	Wisp {
 		protocol: WispClientProtocol,
 		is_wispnet: bool,
+		is_browser: bool,
 	},
 	WsProxy {
 		path: String,
@@ -159,12 +163,14 @@ where
 		let is_wispnet =
 			CONFIG.wisp.has_wispnet() && req.uri().query().unwrap_or_default() == "net";
 		let (protocol, selected) = select_ws_protocol(ws_protocol);
+		let is_browser = headers.contains_key(ORIGIN);
 		tokio::spawn(async move {
 			if let Err(err) = (callback)(
 				fut,
 				HttpUpgradeResult::Wisp {
 					protocol,
 					is_wispnet,
+					is_browser,
 				},
 				ip_header,
 			)
@@ -271,6 +277,7 @@ pub async fn route(
 									HttpUpgradeResult::Wisp {
 										protocol,
 										is_wispnet,
+										is_browser,
 									} => {
 										let ws = ws.downcast::<TokioIo<ServerStream>>().unwrap();
 										let ws =
@@ -288,6 +295,7 @@ pub async fn route(
 											ServerRouteResult::Wisp {
 												stream: (Either::Left(read), Either::Left(write)),
 												protocol,
+												is_browser,
 											}
 										};
 
@@ -330,6 +338,7 @@ pub async fn route(
 					stream: (Either::Right(read), Either::Right(write)),
 					// no negotiation on this transport, so keep the protocol existing clients speak
 					protocol: WispClientProtocol::V2,
+					is_browser: false,
 				},
 				None,
 			);

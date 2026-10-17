@@ -1,22 +1,24 @@
 //! State shared between the multiplexor driver (reader + writer) and stream handles.
 //!
-//! Lock order is `streams` -> stream `state` -> `out`. No lock is held while waking a task.
+//! Lock order is stream `state` -> `streams` -> `out`: nothing takes a stream's state lock
+//! while holding the stream map or the writer queue. Wakers may be woken with a stream's state
+//! lock held; they only schedule tasks.
 
 use std::{
 	collections::VecDeque,
 	mem,
 	sync::{
-		atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
+		atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
 		Arc, Mutex, MutexGuard,
 	},
 	task::{Context, Poll, Waker},
 };
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use rustc_hash::FxHashMap;
 
 use crate::{
-	frame::{OutFrame, Proto},
+	frame::{OutFrame, Proto, DATA_HEADROOM},
 	packet::{CloseReason, ConnectPacket, StreamType},
 	Role, WispError,
 };
@@ -50,6 +52,8 @@ pub(crate) struct MuxParams {
 	pub rx_window: u64,
 	/// WispX: the receive window grows up to this for streams whose reader keeps up.
 	pub rx_max_window: u64,
+	/// WispX: total window growth allowed across all streams of the connection.
+	pub rx_max_growth: u64,
 	/// Queued bytes above which data senders wait for the writer.
 	pub out_high_watermark: usize,
 	/// v1/v2: stream types that are flow controlled, besides TCP.
@@ -97,6 +101,8 @@ pub(crate) struct StreamState {
 	rx_window: u64,
 	/// WispX: bytes consumed since the window last grew.
 	rx_since_growth: u64,
+	/// WispX: how much this stream's window has grown, counted against the connection budget.
+	rx_grown: u64,
 
 	pub tx_credit: u64,
 	tx_waker: Option<Waker>,
@@ -107,8 +113,8 @@ pub(crate) struct StreamState {
 	close_wakers: Vec<Waker>,
 	/// v1/v2 server: the read loop, waiting for this stream to drain.
 	drain_waker: Option<Waker>,
-	/// Removed from the stream map.
-	removed: bool,
+	/// Client: the stream hasn't been announced yet. See [`MuxShared::push_opening`].
+	pending_connect: Option<ConnectPacket>,
 }
 
 impl StreamState {
@@ -126,17 +132,25 @@ impl StreamState {
 }
 
 pub(crate) struct StreamShared {
-	pub id: u32,
+	/// 0 until a client stream is announced, see [`MuxShared::push_opening`].
+	id: AtomicU32,
 	pub stream_type: StreamType,
 	pub flow: bool,
 	/// Number of live user-facing handles. When it hits zero the stream is closed.
 	handles: AtomicUsize,
+	/// Removed from the stream map. Only changed while holding `state`.
+	removed: AtomicBool,
 	state: Mutex<StreamState>,
 }
 
 impl StreamShared {
 	pub fn lock(&self) -> MutexGuard<'_, StreamState> {
 		lock(&self.state)
+	}
+
+	/// The stream ID, or 0 if this client stream hasn't been announced yet.
+	pub fn id(&self) -> u32 {
+		self.id.load(Ordering::Acquire)
 	}
 }
 
@@ -173,6 +187,10 @@ pub(crate) struct MuxShared {
 	dead: AtomicBool,
 	/// Multiplexor handle plus all stream handles. When it hits zero the connection is closed.
 	handles: AtomicUsize,
+	/// WispX: window growth handed out to open streams, see `MuxParams::rx_max_growth`.
+	rx_growth: AtomicU64,
+	/// Frames are waiting in `out`. Lets the read loop check without taking the lock.
+	out_pending: AtomicBool,
 	new_streams: Mutex<Option<flume::Sender<(ConnectPacket, Arc<StreamShared>)>>>,
 }
 
@@ -194,6 +212,8 @@ impl MuxShared {
 			next_stream_id: AtomicU32::new(1),
 			dead: AtomicBool::new(false),
 			handles: AtomicUsize::new(1),
+			rx_growth: AtomicU64::new(0),
+			out_pending: AtomicBool::new(false),
 			new_streams: Mutex::new(new_streams),
 		}
 	}
@@ -244,6 +264,7 @@ impl MuxShared {
 				out.bytes += frame.queued_len();
 				out.frames.push_back(frame);
 			}
+			self.out_pending.store(true, Ordering::Relaxed);
 			out.writer.take()
 		};
 		if let Some(waker) = waker {
@@ -282,6 +303,7 @@ impl MuxShared {
 			mem::swap(&mut out.frames, buf);
 			out.bytes = 0;
 			mem::swap(&mut out.blocked, blocked);
+			self.out_pending.store(false, Ordering::Relaxed);
 			return Poll::Ready(WriterEvent::Frames);
 		}
 		match out.state {
@@ -299,7 +321,7 @@ impl MuxShared {
 
 	/// Whether frames are waiting for the writer.
 	pub fn has_queued_frames(&self) -> bool {
-		!lock(&self.out).frames.is_empty()
+		self.out_pending.load(Ordering::Relaxed)
 	}
 
 	/// Called by the writer: grab frames queued since the last poll without waiting.
@@ -311,6 +333,7 @@ impl MuxShared {
 			mem::swap(&mut out.frames, buf);
 			out.bytes = 0;
 			mem::swap(&mut out.blocked, blocked);
+			self.out_pending.store(false, Ordering::Relaxed);
 			true
 		}
 	}
@@ -350,10 +373,11 @@ impl MuxShared {
 		for stream in streams {
 			let wakers = {
 				let mut state = stream.lock();
-				state.removed = true;
+				stream.removed.store(true, Ordering::Relaxed);
 				if state.closed.is_none() {
 					state.closed = Some(CloseReason::Unknown);
 				}
+				self.release_growth(&mut state);
 				state.take_all_wakers()
 			};
 			wakers.into_iter().for_each(Waker::wake);
@@ -362,7 +386,12 @@ impl MuxShared {
 
 	// ---- stream table ----
 
-	fn create_stream(&self, id: u32, stream_type: StreamType) -> Arc<StreamShared> {
+	fn create_stream(
+		&self,
+		id: u32,
+		stream_type: StreamType,
+		pending_connect: Option<ConnectPacket>,
+	) -> Arc<StreamShared> {
 		let flow = self.params.is_flow_controlled(stream_type);
 		let tx_credit = if flow && self.params.tracks_credit() {
 			self.params.tx_window
@@ -372,10 +401,11 @@ impl MuxShared {
 		#[expect(clippy::cast_possible_wrap)]
 		let rx_peer_credit = self.params.rx_window as i64;
 		Arc::new(StreamShared {
-			id,
+			id: AtomicU32::new(id),
 			stream_type,
 			flow,
 			handles: AtomicUsize::new(0),
+			removed: AtomicBool::new(false),
 			state: Mutex::new(StreamState {
 				rx: VecDeque::new(),
 				rx_bytes: 0,
@@ -385,13 +415,14 @@ impl MuxShared {
 				rx_peer_credit,
 				rx_window: self.params.rx_window,
 				rx_since_growth: 0,
+				rx_grown: 0,
 				tx_credit,
 				tx_waker: None,
 				tx_fin: false,
 				closed: None,
 				close_wakers: Vec::new(),
 				drain_waker: None,
-				removed: false,
+				pending_connect,
 			}),
 		})
 	}
@@ -404,42 +435,76 @@ impl MuxShared {
 		lock(&self.streams).remove(&id);
 	}
 
-	/// Client: allocate an ID, register a stream and queue its CONNECT.
-	///
-	/// The ID is allocated while holding the writer queue lock, so CONNECTs always go out in ID
-	/// order even when streams are opened concurrently (WispX requires increasing IDs).
-	pub fn open_stream(&self, connect: &ConnectPacket) -> Result<Arc<StreamShared>, WispError> {
+	/// Client: create a stream. It is announced (ID allocated, CONNECT queued) together with its
+	/// first frame, see [`Self::push_opening`].
+	pub fn open_stream(&self, connect: ConnectPacket) -> Result<Arc<StreamShared>, WispError> {
 		if self.is_dead() {
 			return Err(WispError::MuxTaskEnded);
 		}
+		Ok(self.create_stream(0, connect.stream_type, Some(connect)))
+	}
+
+	/// Queue a stream's frames, announcing the stream first if it hasn't been yet.
+	///
+	/// Client streams are announced lazily: the ID is allocated and the CONNECT queued in the
+	/// same writer-queue critical section as the stream's first frame, so the CONNECT always
+	/// shares a websocket message with the first data (a TLS ClientHello or HTTP request) instead
+	/// of going out alone. Allocating the ID at this point also keeps CONNECTs in ID order, which
+	/// WispX requires, however streams are opened. A stream dropped before it sends anything
+	/// never touches the wire.
+	///
+	/// `frames` gets the stream ID. The caller holds the stream's state lock.
+	fn push_opening(
+		&self,
+		stream: &Arc<StreamShared>,
+		state: &mut StreamState,
+		frames: impl FnOnce(u32) -> [Option<OutFrame>; 2],
+	) -> Result<(), WispError> {
+		let Some(connect) = state.pending_connect.take() else {
+			return self.push_frames(frames(stream.id()).into_iter().flatten());
+		};
 
 		let mut streams = lock(&self.streams);
-		let (stream, waker) = {
+		let waker = {
 			let mut out = lock(&self.out);
 			if !matches!(out.state, OutState::Open) {
+				state.closed.get_or_insert(CloseReason::Unknown);
 				return Err(WispError::MuxTaskEnded);
 			}
 			// 0 marks the ID space as exhausted
 			let id = self.next_stream_id.load(Ordering::Relaxed);
 			if id == 0 {
+				state.closed.get_or_insert(CloseReason::Unknown);
 				return Err(WispError::MaxStreamCountReached);
 			}
 			self.next_stream_id
 				.store(id.checked_add(1).unwrap_or(0), Ordering::Relaxed);
+			stream.id.store(id, Ordering::Release);
+			streams.insert(id, stream.clone());
 
-			let stream = self.create_stream(id, connect.stream_type);
-			let frame = OutFrame::connect(id, connect);
-			out.bytes += frame.queued_len();
-			out.frames.push_back(frame);
-			(stream, out.writer.take())
+			for frame in std::iter::once(OutFrame::connect(id, &connect))
+				.chain(frames(id).into_iter().flatten())
+			{
+				out.bytes += frame.queued_len();
+				out.frames.push_back(frame);
+			}
+			self.out_pending.store(true, Ordering::Relaxed);
+			out.writer.take()
 		};
-		streams.insert(stream.id, stream.clone());
 		drop(streams);
-
 		if let Some(waker) = waker {
 			waker.wake();
 		}
-		Ok(stream)
+		Ok(())
+	}
+
+	/// Announce the stream if it hasn't been yet, and return its ID.
+	pub fn ensure_open(&self, stream: &Arc<StreamShared>) -> u32 {
+		let mut state = stream.lock();
+		if state.pending_connect.is_some() {
+			let _ = self.push_opening(stream, &mut state, |_| [None, None]);
+		}
+		stream.id()
 	}
 
 	/// Server: register a stream the client asked for. Returns false if the ID is already in use.
@@ -449,7 +514,7 @@ impl MuxShared {
 			if streams.contains_key(&id) {
 				return false;
 			}
-			let stream = self.create_stream(id, connect.stream_type);
+			let stream = self.create_stream(id, connect.stream_type, None);
 			streams.insert(id, stream.clone());
 			stream
 		};
@@ -463,11 +528,48 @@ impl MuxShared {
 		true
 	}
 
+	/// Take `amount` from the connection's window growth budget, if it has that much left.
+	fn try_take_growth(&self, amount: u64) -> bool {
+		let mut current = self.rx_growth.load(Ordering::Relaxed);
+		loop {
+			if current + amount > self.params.rx_max_growth {
+				return false;
+			}
+			match self.rx_growth.compare_exchange_weak(
+				current,
+				current + amount,
+				Ordering::Relaxed,
+				Ordering::Relaxed,
+			) {
+				Ok(_) => return true,
+				Err(x) => current = x,
+			}
+		}
+	}
+
+	/// The stream won't receive any more data: return its window growth to the connection.
+	fn release_growth(&self, state: &mut StreamState) {
+		if state.rx_grown > 0 {
+			self.rx_growth.fetch_sub(state.rx_grown, Ordering::Relaxed);
+			state.rx_grown = 0;
+		}
+	}
+
 	// ---- local stream operations ----
 
 	/// Wait for a queued chunk. Returns `None` at end of stream.
-	pub fn poll_recv(&self, stream: &StreamShared, cx: &mut Context<'_>) -> Poll<Option<Bytes>> {
+	pub fn poll_recv(
+		&self,
+		stream: &Arc<StreamShared>,
+		cx: &mut Context<'_>,
+	) -> Poll<Option<Bytes>> {
 		let mut state = stream.lock();
+		if state.pending_connect.is_some()
+			&& self.push_opening(stream, &mut state, |_| [None, None]).is_err()
+		{
+			// the reader is waiting for the peer, so the stream has to exist now
+			return Poll::Ready(None);
+		}
 		if let Some(chunk) = state.rx.pop_front() {
 			state.rx_bytes -= chunk.len();
 			let credit = self.account_consumed(stream, &mut state, chunk.len());
@@ -520,12 +622,16 @@ impl MuxShared {
 					// window big enough for fast, high-latency links within a few round trips,
 					// and credit updates get rarer as the window grows. A stream nobody reads
 					// never grows, so unread data stays bounded by the initial window.
+					// The connection budget stops one connection from growing many windows at once.
 					if state.rx_since_growth >= state.rx_window
 						&& state.rx_window < self.params.rx_max_window
 					{
 						let extra = state.rx_window.min(self.params.rx_max_window - state.rx_window);
-						state.rx_window += extra;
-						increment += extra;
+						if self.try_take_growth(extra) {
+							state.rx_window += extra;
+							state.rx_grown += extra;
+							increment += extra;
+						}
 						state.rx_since_growth = 0;
 					}
 					#[expect(clippy::cast_possible_wrap)]
@@ -533,7 +639,7 @@ impl MuxShared {
 						state.rx_peer_credit += increment as i64;
 					}
 					#[expect(clippy::cast_possible_truncation)]
-					Some(OutFrame::credit(stream.id, increment as u32))
+					Some(OutFrame::credit(stream.id(), increment as u32))
 				} else {
 					None
 				}
@@ -545,7 +651,7 @@ impl MuxShared {
 					state.rx_unacked = 0;
 					let remaining = window.saturating_sub(state.rx.len() as u64);
 					#[expect(clippy::cast_possible_truncation)]
-					Some(OutFrame::credit(stream.id, remaining as u32))
+					Some(OutFrame::credit(stream.id(), remaining as u32))
 				} else {
 					None
 				}
@@ -590,45 +696,158 @@ impl MuxShared {
 		}
 	}
 
+	/// Check the stream can send and take credit for up to `len` payload bytes. Returns how many
+	/// bytes may be sent now (0 if there's no credit).
+	fn take_credit(
+		&self,
+		stream: &StreamShared,
+		state: &mut StreamState,
+		len: usize,
+	) -> Result<usize, WispError> {
+		if state.closed.is_some() || state.tx_fin {
+			return Err(WispError::StreamAlreadyClosed);
+		}
+		if state.tx_credit == 0 {
+			return Ok(0);
+		}
+		if stream.stream_type == StreamType::Udp {
+			// datagrams can't be split
+			return Ok(len);
+		}
+		let mut len = len.min(self.params.max_frame_payload);
+		if state.tx_credit != UNLIMITED {
+			if self.params.proto == Proto::X {
+				len = len.min(usize::try_from(state.tx_credit).unwrap_or(usize::MAX));
+				state.tx_credit -= len as u64;
+			} else {
+				state.tx_credit -= 1;
+			}
+		}
+		Ok(len)
+	}
+
 	/// Queue as much of `data` as credit allows. Returns the part that was not sent.
-	pub fn send_data(&self, stream: &StreamShared, mut data: Bytes) -> Result<Bytes, WispError> {
+	pub fn send_data(
+		&self,
+		stream: &Arc<StreamShared>,
+		mut data: Bytes,
+	) -> Result<Bytes, WispError> {
 		if data.is_empty() {
 			return Ok(data);
 		}
-		let frame = {
+		let mut state = stream.lock();
+		let len = self.take_credit(stream, &mut state, data.len())?;
+		if len == 0 {
+			return Ok(data);
+		}
+		let chunk = data.split_to(len);
+		self.push_opening(stream, &mut state, |id| {
+			[Some(OutFrame::data(id, chunk)), None]
+		})?;
+		Ok(data)
+	}
+
+	/// Like [`Self::send_data`] for a buffer that starts with [`DATA_HEADROOM`] scratch bytes,
+	/// which lets the writer send it without copying. Returns the part that was not sent.
+	pub fn send_data_with_headroom(
+		&self,
+		stream: &Arc<StreamShared>,
+		mut data: BytesMut,
+	) -> Result<Bytes, WispError> {
+		let payload = data.len() - DATA_HEADROOM;
+		if payload == 0 {
+			return Ok(Bytes::new());
+		}
+		let mut state = stream.lock();
+		let len = self.take_credit(stream, &mut state, payload)?;
+		if len == 0 {
+			return Ok(data.split_off(DATA_HEADROOM).freeze());
+		}
+		let rest = data.split_off(DATA_HEADROOM + len).freeze();
+		self.push_opening(stream, &mut state, |id| {
+			[Some(OutFrame::data_with_headroom(id, data)), None]
+		})?;
+		Ok(rest)
+	}
+
+	/// Send `data` (with [`DATA_HEADROOM`]) and finish the stream (FIN, or CLOSE where there is
+	/// no half-close) in one go, so both leave in the same write. Returns the data unsent if
+	/// credit doesn't cover all of it; the caller then sends it normally and finishes after.
+	pub fn send_last_with_headroom(
+		&self,
+		stream: &Arc<StreamShared>,
+		data: BytesMut,
+	) -> Result<Option<BytesMut>, WispError> {
+		let half_close = self.params.proto == Proto::X && stream.stream_type != StreamType::Udp;
+		let payload = data.len() - DATA_HEADROOM;
+		let (wakers, remove) = {
 			let mut state = stream.lock();
 			if state.closed.is_some() || state.tx_fin {
 				return Err(WispError::StreamAlreadyClosed);
 			}
-			if state.tx_credit == 0 {
-				return Ok(data);
+			let fits = stream.stream_type == StreamType::Udp
+				|| (payload <= self.params.max_frame_payload
+					&& (state.tx_credit == UNLIMITED
+						|| (self.params.proto == Proto::X && state.tx_credit >= payload as u64)
+						|| (self.params.proto != Proto::X && state.tx_credit >= 1)));
+			if !fits {
+				return Ok(Some(data));
 			}
-			if stream.stream_type == StreamType::Udp {
-				// datagrams can't be split
-				mem::take(&mut data)
+			if state.tx_credit != UNLIMITED {
+				state.tx_credit -= if self.params.proto == Proto::X {
+					payload as u64
+				} else {
+					1
+				};
+			}
+			let last = if half_close {
+				state.tx_fin = true;
+				None
 			} else {
-				let mut len = data.len().min(self.params.max_frame_payload);
-				if state.tx_credit != UNLIMITED {
-					if self.params.proto == Proto::X {
-						len = len.min(usize::try_from(state.tx_credit).unwrap_or(usize::MAX));
-						state.tx_credit -= len as u64;
-					} else {
-						state.tx_credit -= 1;
-					}
-				}
-				data.split_to(len)
-			}
+				state.closed = Some(CloseReason::Voluntary);
+				state.rx.clear();
+				state.rx_bytes = 0;
+				self.release_growth(&mut state);
+				Some(CloseReason::Voluntary)
+			};
+			let data = (payload > 0).then_some(data);
+			self.push_opening(stream, &mut state, |id| {
+				[
+					data.map(|x| OutFrame::data_with_headroom(id, x)),
+					Some(match last {
+						None => OutFrame::fin(id),
+						Some(reason) => OutFrame::close(id, reason),
+					}),
+				]
+			})?;
+			let done = last.is_some() || state.rx_eof;
+			let remove = done && !stream.removed.swap(true, Ordering::Relaxed);
+			let wakers = if last.is_some() {
+				state.take_all_wakers()
+			} else {
+				Vec::new()
+			};
+			(wakers, remove)
 		};
-		self.enqueue(OutFrame::data(stream.id, frame))?;
-		Ok(data)
+		wakers.into_iter().for_each(Waker::wake);
+		if remove {
+			self.remove_stream(stream.id());
+		}
+		Ok(None)
 	}
 
 	/// Send a raw extension packet on this stream's ID.
-	pub fn send_raw(&self, stream: &StreamShared, ty: u8, data: Bytes) -> Result<(), WispError> {
-		if stream.lock().closed.is_some() {
+	pub fn send_raw(
+		&self,
+		stream: &Arc<StreamShared>,
+		ty: u8,
+		data: Bytes,
+	) -> Result<(), WispError> {
+		let mut state = stream.lock();
+		if state.closed.is_some() {
 			return Err(WispError::StreamAlreadyClosed);
 		}
-		self.enqueue(OutFrame::raw(ty, stream.id, data))
+		self.push_opening(stream, &mut state, |id| [Some(OutFrame::raw(ty, id, data)), None])
 	}
 
 	/// Abort the stream in both directions.
@@ -638,22 +857,31 @@ impl MuxShared {
 			if state.closed.is_some() || state.fully_finished() {
 				return Err(WispError::StreamAlreadyClosed);
 			}
+			if state.pending_connect.take().is_some() {
+				// never announced, so there's nothing to tell the peer
+				state.closed = Some(reason);
+				let wakers = state.take_all_wakers();
+				drop(state);
+				wakers.into_iter().for_each(Waker::wake);
+				return Ok(());
+			}
 			state.closed = Some(reason);
 			state.rx.clear();
 			state.rx_bytes = 0;
-			let was_removed = mem::replace(&mut state.removed, true);
+			self.release_growth(&mut state);
+			let was_removed = stream.removed.swap(true, Ordering::Relaxed);
 			(state.take_all_wakers(), was_removed)
 		};
 		wakers.into_iter().for_each(Waker::wake);
 		if !was_removed {
-			self.remove_stream(stream.id);
+			self.remove_stream(stream.id());
 		}
-		self.enqueue(OutFrame::close(stream.id, reason))
+		self.enqueue(OutFrame::close(stream.id(), reason))
 	}
 
 	/// Half-close: we will send no more data. Falls back to a full close where the protocol has
 	/// no half-close (v1/v2, and UDP streams).
-	pub fn finish_stream(&self, stream: &StreamShared) -> Result<(), WispError> {
+	pub fn finish_stream(&self, stream: &Arc<StreamShared>) -> Result<(), WispError> {
 		if self.params.proto != Proto::X || stream.stream_type == StreamType::Udp {
 			return match self.close_stream(stream, CloseReason::Voluntary) {
 				Err(WispError::StreamAlreadyClosed) => Ok(()),
@@ -669,16 +897,17 @@ impl MuxShared {
 				return Ok(());
 			}
 			state.tx_fin = true;
-			let done = state.rx_eof && !state.removed;
+			self.push_opening(stream, &mut state, |id| [Some(OutFrame::fin(id)), None])?;
+			let done = state.rx_eof && !stream.removed.load(Ordering::Relaxed);
 			if done {
-				state.removed = true;
+				stream.removed.store(true, Ordering::Relaxed);
 			}
 			done
 		};
 		if done {
-			self.remove_stream(stream.id);
+			self.remove_stream(stream.id());
 		}
-		self.enqueue(OutFrame::fin(stream.id))
+		Ok(())
 	}
 
 	pub fn close_reason(&self, stream: &StreamShared) -> Option<CloseReason> {
@@ -708,8 +937,25 @@ impl MuxShared {
 	/// A WispX peer that overruns its credit gets the stream closed with
 	/// [`CloseReason::ProtocolViolation`]. For v1/v2, returns the stream if the read loop should
 	/// wait for it to drain (see [`V2_PAUSE_BYTES`]). Data is never dropped from an open stream.
-	pub fn on_data(&self, id: u32, data: Bytes) -> Option<Arc<StreamShared>> {
-		let stream = self.get_stream(id)?;
+	///
+	/// `cache` holds the stream of the previous DATA frame: consecutive frames usually belong to
+	/// the same stream, and this skips the stream map lock.
+	pub fn on_data(
+		&self,
+		id: u32,
+		data: Bytes,
+		cache: &mut Option<Arc<StreamShared>>,
+	) -> Option<Arc<StreamShared>> {
+		let stream = match cache {
+			Some(stream) if stream.id() == id && !stream.removed.load(Ordering::Relaxed) => {
+				stream.clone()
+			}
+			_ => {
+				let stream = self.get_stream(id)?;
+				*cache = Some(stream.clone());
+				stream
+			}
+		};
 		let (waker, pause) = {
 			let mut state = stream.lock();
 			if state.closed.is_some() || state.rx_eof {
@@ -778,12 +1024,13 @@ impl MuxShared {
 		};
 		let wakers = {
 			let mut state = stream.lock();
-			state.removed = true;
+			stream.removed.store(true, Ordering::Relaxed);
 			if state.closed.is_some() {
 				return;
 			}
 			// keep already-received data readable
 			state.closed = Some(reason);
+			self.release_growth(&mut state);
 			state.take_all_wakers()
 		};
 		wakers.into_iter().for_each(Waker::wake);
@@ -799,9 +1046,10 @@ impl MuxShared {
 				return;
 			}
 			state.rx_eof = true;
-			let done = state.tx_fin && !state.removed;
+			self.release_growth(&mut state);
+			let done = state.tx_fin && !stream.removed.load(Ordering::Relaxed);
 			if done {
-				state.removed = true;
+				stream.removed.store(true, Ordering::Relaxed);
 			}
 			(state.rx_waker.take(), done)
 		};

@@ -12,7 +12,7 @@ pub mod packet;
 pub mod stream;
 pub mod ws;
 
-pub use frame::WISPX_MIN_MESSAGE_SIZE;
+pub use frame::{DATA_HEADROOM, WISPX_MIN_MESSAGE_SIZE};
 pub use mux::*;
 
 /// Latest supported Wisp v2 version.

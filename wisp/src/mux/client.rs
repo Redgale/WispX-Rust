@@ -1,7 +1,10 @@
 use bytes::Bytes;
 
 use crate::{
-	extensions::udp::UdpProtocolExtension,
+	extensions::{
+		drain::{DrainOnCloseProtocolExtension, DrainOnCloseProtocolExtensionBuilder},
+		udp::UdpProtocolExtension,
+	},
 	frame::{classify_server_first_message, OutFrame, Proto, ServerFirstMessage, TY_INFO},
 	packet::{ConnectPacket, HelloPacket, InfoPacket, Packet, StreamType},
 	stream::MuxStream,
@@ -44,6 +47,14 @@ async fn handshake_v1_v2<R: TransportRead, W: TransportWrite>(
 			buffer_size,
 		));
 	};
+
+	// this client keeps received data on CLOSE, tell the server it needn't delay its CLOSEs
+	if !builders
+		.iter()
+		.any(|x| x.get_id() == DrainOnCloseProtocolExtension::ID)
+	{
+		builders.push(DrainOnCloseProtocolExtensionBuilder.into());
+	}
 
 	if first.first() == Some(&TY_INFO) {
 		// v2 server
@@ -106,6 +117,7 @@ async fn handshake_x<R: TransportRead, W: TransportWrite>(
 		},
 		stream_window,
 		max_stream_window,
+		max_connection_window,
 		max_message_size,
 		max_batch_size,
 	} = options;
@@ -131,6 +143,7 @@ async fn handshake_x<R: TransportRead, W: TransportWrite>(
 		max_batch_size,
 		stream_window,
 		max_stream_window,
+		max_connection_window,
 		hello.max_message_size,
 		hello.stream_window,
 	);
@@ -178,8 +191,8 @@ impl<W: TransportWrite> Multiplexor<ClientImpl, W> {
 
 	/// Create a new stream, multiplexed through Wisp.
 	///
-	/// This does not wait for the server: data written to the stream right away is sent after
-	/// the CONNECT, often in the same websocket message.
+	/// This does not wait for the server. The CONNECT is sent together with the stream's first
+	/// data (or when it first waits to read), in the same websocket message on WispX.
 	pub async fn new_stream(
 		&self,
 		stream_type: StreamType,
@@ -201,7 +214,7 @@ impl<W: TransportWrite> Multiplexor<ClientImpl, W> {
 			]));
 		}
 
-		let stream = self.shared.open_stream(&ConnectPacket {
+		let stream = self.shared.open_stream(ConnectPacket {
 			stream_type,
 			host,
 			port,
