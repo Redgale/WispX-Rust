@@ -1,6 +1,6 @@
 # WispX-Rust
 
-The Rust implementation of [WispX](TODO-WISPX-PROTOCOL-URL), a faster version of the Wisp protocol:
+The Rust implementation of [WispX](https://github.com/Redgale/WispX-Protocol), a faster version of the Wisp protocol:
 the client and server library, a WispX server, and the epoxy browser client with WispX support.
 It's a fork of [epoxy-tls](https://github.com/MercuryWorkshop/epoxy-tls) (multiplexed branch),
 whose history it keeps; the first commit is the unmodified upstream snapshot.
@@ -22,8 +22,8 @@ bugs fixed along the way, server configuration, the library API, and build instr
 
 Related repositories:
 
-- [WispX-Protocol](TODO-WISPX-PROTOCOL-URL) - the WispX specification (and the Wisp V1/V2 ones)
-- [WispX Browser](TODO-WISPX-BROWSER-URL) - a single-file, service-worker-less Scramjet browser built on the client here
+- [WispX-Protocol](https://github.com/Redgale/WispX-Protocol) - the WispX specification (and the Wisp V1/V2 ones)
+- [WispX Browser](https://github.com/Redgale/WispX-Browser) - a single-file, service-worker-less Scramjet browser built on the client here
 
 ## Quick start
 

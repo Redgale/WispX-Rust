@@ -19,7 +19,7 @@
 	"author": "MercuryWorkshop, WispX contributors",
 	"repository": {
 		"type": "git",
-		"url": "git+TODO-WISPX-RUST-URL.git",
+		"url": "git+https://github.com/Redgale/WispX-Rust.git",
 		"directory": "client"
 	},
 	"license": "AGPL-3.0-only",

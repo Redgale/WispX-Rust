@@ -2,7 +2,7 @@
 
 A proxy transport (for Scramjet, bare-mux and anything else that takes a `ProxyTransport`) that runs
 TLS in the browser with [wispx-epoxy-tls](https://www.npmjs.com/package/wispx-epoxy-tls) and talks
-[WispX](TODO-WISPX-PROTOCOL-URL) to the Wisp server, falling back to Wisp V2/V1 on servers without
+[WispX](https://github.com/Redgale/WispX-Protocol) to the Wisp server, falling back to Wisp V2/V1 on servers without
 it. It's [epoxy-transport](https://github.com/MercuryWorkshop/epoxy-transport) 3.0.1 with a `wispx`
 option and the WispX build of the epoxy client bundled in (nothing else to install).
 
@@ -37,7 +37,7 @@ There's also a non-ESM build that sets a global `EpoxyTransport` (the module; th
 ```
 
 Only enable `wispx` for servers that answer the websocket subprotocol they're offered, such as
-epoxy-server from [WispX-Rust](TODO-WISPX-RUST-URL) (or upstream epoxy-server, which then speaks V2).
+epoxy-server from [WispX-Rust](https://github.com/Redgale/WispX-Rust) (or upstream epoxy-server, which then speaks V2).
 A server that ignores `Sec-WebSocket-Protocol` makes the browser reject the websocket; the same is
 true of the `wisp_v2` option.
 

@@ -21,7 +21,7 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+TODO-WISPX-RUST-URL.git",
+    "url": "git+https://github.com/Redgale/WispX-Rust.git",
     "directory": "integrations/scramjet/epoxy-transport"
   },
   "dependencies": {

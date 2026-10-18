@@ -29,7 +29,7 @@ const transport = new EpoxyTransport({ wisp: "wss://your-server.example/", wisp_
 
 The rest of this page builds them yourself.
 
-The single-file browser in [WispX Browser](TODO-WISPX-BROWSER-URL) already has all of
+The single-file browser in [WispX Browser](https://github.com/Redgale/WispX-Browser) already has all of
 this built in: it uses the WispX client directly (no epoxy-transport), with WispX on by default.
 
 Step 1 on its own already helps: existing clients keep speaking v1/v2 but get the faster server

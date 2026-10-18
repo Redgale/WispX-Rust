@@ -2,13 +2,13 @@
 
 This repository is [epoxy-tls](https://github.com/MercuryWorkshop/epoxy-tls) (multiplexed branch) with:
 
-- **WispX**, a faster Wisp protocol (spec: [`protocolX.md` in WispX-Protocol](TODO-WISPX-PROTOCOL-URL/blob/main/protocolX.md)).
+- **WispX**, a faster Wisp protocol (spec: [`protocolX.md` in WispX-Protocol](https://github.com/Redgale/WispX-Protocol/blob/v2/protocolX.md)).
 - **A rewritten `wisp-mux` core** that speaks Wisp v1, v2 and WispX, with the same public API.
 - **epoxy-server** changes to serve WispX and to relay streams with fewer copies, syscalls and
   messages.
 - **epoxy-client** (the browser library behind Scramjet's epoxy transport): a new opt-in
   `wispx` option. See [`integrations/scramjet`](integrations/scramjet/README.md), and the
-  [WispX Browser](TODO-WISPX-BROWSER-URL), which has it built in.
+  [WispX Browser](https://github.com/Redgale/WispX-Browser), which has it built in.
 - **`bench/`**: native and browser benchmarks, including the original wisp-mux 6.0 client
   (vendored as `wisp-mux-legacy`) and the published epoxy-tls 2.1.19 browser client.
 
