@@ -1,12 +1,14 @@
 {
-	"name": "@mercuryworkshop/epoxy-tls",
-	"version": "2.1.19-1",
-	"description": "A wasm library for using raw encrypted tls/ssl/tcp/udp/https/websocket streams on the browser",
+	"name": "wispx-epoxy-tls",
+	"version": "1.0.0",
+	"description": "epoxy-tls with WispX: a wasm library for encrypted TLS/TCP/UDP/HTTPS/WebSocket streams in the browser over Wisp, speaking WispX (and Wisp V2/V1)",
 	"scripts": {
 		"build": "bash build.sh",
 		"prepack": "npm run build && bash publish.sh"
 	},
 	"keywords": [
+		"wispx",
+		"wisp",
 		"wasm",
 		"ssl",
 		"tls",
@@ -14,12 +16,19 @@
 		"proxy",
 		"http"
 	],
-	"author": "MercuryWorkshop",
+	"author": "MercuryWorkshop, WispX contributors",
 	"repository": {
 		"type": "git",
-		"url": "git+https://github.com/MercuryWorkshop/epoxy-tls.git"
+		"url": "git+TODO-WISPX-RUST-URL.git",
+		"directory": "client"
 	},
 	"license": "AGPL-3.0-only",
+	"files": [
+		"full",
+		"minimal",
+		"README.md",
+		"LICENSE"
+	],
 	"packageManager": "pnpm@10.27.0",
 	"exports": {
 		".": {

@@ -8,7 +8,7 @@ import initEpoxy, {
 	EpoxyClientOptions,
 	EpoxyHandlers,
 	info as epoxyInfo,
-} from "@mercuryworkshop/epoxy-tls";
+} from "wispx-epoxy-tls";
 
 export { epoxyInfo };
 

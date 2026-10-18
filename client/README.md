@@ -20,16 +20,16 @@ The WASM binary and JS bindings will be placed in `pkg`.
 Examples are available in [`demo.js`](demo.js).
 
 ```js
-import init, { EpoxyClient, EpoxyClientOptions, EpoxyHandlers } from "@mercuryworkshop/epoxy-tls/epoxy";
+import init, { EpoxyClient, EpoxyClientOptions, EpoxyHandlers } from "wispx-epoxy-tls/epoxy";
 
 // you can also pass in the wasm after fetching it. see the typescript types for all options
 await init({ module_or_path: "path/to/epoxy.wasm" });
 
-// or you can import "@mercuryworkshop/epoxy-tls" or "@mercuryworkshop/epoxy-tls/epoxy-bundled"
+// or you can import "wispx-epoxy-tls" or "wispx-epoxy-tls/epoxy-bundled"
 // those versions have the wasm bundled into the JS as base64 so you don't need to pass anything to init()
 //
 // there is also a minimal version with only HTTP/1 fetch and TLS/TCP/UDP streams if you want a smaller
-// bundle size. those can be imported via "@mercuryworkshop/epoxy-tls/minimal" and "minimal-bundled"
+// bundle size. those can be imported via "wispx-epoxy-tls/minimal" and "minimal-bundled"
 
 const options = new EpoxyClientOptions();
 options.user_agent = navigator.userAgent;

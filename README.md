@@ -12,10 +12,10 @@ and WispX clients fall back to V2/V1 on servers that don't support WispX.
 | --- | --- |
 | [`wisp/`](wisp) | `wisp-mux`, the protocol library: one multiplexor core for both the **client and the server side** of WispX, Wisp V2 and Wisp V1 |
 | [`server/`](server) | `epoxy-server`, the **WispX server**, serving V1/V2 clients too |
-| [`client/`](client) | the **epoxy client** (Rust compiled to WebAssembly) that browser proxies use, with a `wispx` option |
-| [`integrations/scramjet/`](integrations/scramjet) | using the WispX client with Scramjet's epoxy-transport |
+| [`client/`](client) | the **epoxy client** (Rust compiled to WebAssembly) that browser proxies use, with a `wispx` option; npm: [`wispx-epoxy-tls`](https://www.npmjs.com/package/wispx-epoxy-tls) |
+| [`integrations/scramjet/`](integrations/scramjet) | using WispX with Scramjet; its transport is on npm as [`wispx-epoxy-transport`](https://www.npmjs.com/package/wispx-epoxy-transport) |
 | [`bench/`](bench) | native and headless-Chrome benchmarks against the original wisp-mux 6.0 and epoxy-tls 2.1.19 |
-| [`simple-wisp-client/`](simple-wisp-client), [`client-showcase/`](client-showcase) | upstream test client and demo page |
+| [`simple-wisp-client/`](simple-wisp-client) | upstream command-line test client |
 
 **[`WISPX.md`](WISPX.md) has the details:** benchmark results, what changed and why, the upstream
 bugs fixed along the way, server configuration, the library API, and build instructions.
@@ -40,6 +40,19 @@ cargo test -p wisp-mux --all-features
 The browser client needs nightly Rust and the wasm toolchain; see
 [`integrations/scramjet/README.md`](integrations/scramjet/README.md#build-the-client) and the
 [client readme](client/README.md).
+
+## npm packages
+
+| Package | What it is |
+| --- | --- |
+| [`wispx-epoxy-tls`](https://www.npmjs.com/package/wispx-epoxy-tls) | the epoxy client from [`client/`](client) |
+| [`wispx-epoxy-transport`](https://www.npmjs.com/package/wispx-epoxy-transport) | a Scramjet / bare-mux transport with the client bundled in (`npm install wispx-epoxy-transport`) |
+
+CI builds and packs both on every push. On a push to `main` it attaches them to a "latest"
+GitHub pre-release and publishes each one whose `package.json` version isn't on npm yet, so a
+release is: bump `version` in `client/package.json` and/or
+`integrations/scramjet/epoxy-transport/package.json`, then push. Publishing needs an npm access
+token in the repository secret `NPM_TOKEN`.
 
 ## License
 

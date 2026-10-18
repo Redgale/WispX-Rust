@@ -1,24 +1,38 @@
 {
-  "name": "@mercuryworkshop/epoxy-transport",
-  "version": "3.0.1",
-  "description": "a bare transport that implements end-to-end encryption with epoxy-tls and wisp",
+  "name": "wispx-epoxy-transport",
+  "version": "1.0.0",
+  "description": "epoxy-transport with WispX: a Scramjet/bare-mux transport with end-to-end encryption over Wisp, speaking WispX (falls back to Wisp V2/V1)",
   "main": "./dist/index.mjs",
-  "keywords": [],
-  "author": "",
+  "keywords": [
+    "wispx",
+    "wisp",
+    "scramjet",
+    "bare-mux",
+    "proxy-transport",
+    "epoxy"
+  ],
+  "author": "MercuryWorkshop, WispX contributors",
   "type": "module",
   "license": "AGPL-3.0-only",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/MercuryWorkshop/epoxy-transport.git"
+    "url": "git+TODO-WISPX-RUST-URL.git",
+    "directory": "integrations/scramjet/epoxy-transport"
   },
   "dependencies": {
-    "@mercuryworkshop/epoxy-tls": "2.1.19-1"
+    "wispx-epoxy-tls": "^1.0.0"
   },
   "devDependencies": {
     "@mercuryworkshop/proxy-transports": "^1.0.2",
     "esbuild": "^0.25.8",
     "esbuild-plugin-d.ts": "^1.3.1",
-    "esbuild-plugin-umd-wrapper": "^3.0.0"
+    "esbuild-plugin-umd-wrapper": "^3.0.0",
+    "typescript": "~5.9.3"
   },
   "exports": {
     ".": {
@@ -28,6 +42,7 @@
     }
   },
   "scripts": {
-    "build": "node esbuild.bundle.mjs"
+    "build": "node esbuild.bundle.mjs",
+    "prepack": "node esbuild.bundle.mjs"
   }
 }

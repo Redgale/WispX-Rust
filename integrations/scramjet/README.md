@@ -15,6 +15,20 @@ wasm), which uses `wisp-mux` to talk to the Wisp server. So WispX needs:
 
 Scramjet and the controller need no changes.
 
+**The short way:** steps 2 and 3 are on npm as one package, `wispx-epoxy-transport` (the patched
+transport with the WispX client bundled in), so only the server needs building:
+
+```bash
+npm install wispx-epoxy-transport
+```
+
+```js
+import EpoxyTransport from "wispx-epoxy-transport";
+const transport = new EpoxyTransport({ wisp: "wss://your-server.example/", wisp_v2: true, wispx: true });
+```
+
+The rest of this page builds them yourself.
+
 The single-file browser in [WispX Browser](TODO-WISPX-BROWSER-URL) already has all of
 this built in: it uses the WispX client directly (no epoxy-transport), with WispX on by default.
 
