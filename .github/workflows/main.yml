@@ -212,7 +212,8 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           release() { # name version
-            TGZ="packages/$1-$2.tgz"
+            # "./": without it, npm 11 reads "packages/x.tgz" as a GitHub repo (user/repo)
+            TGZ="./packages/$1-$2.tgz"
             if npm publish "$TGZ" --access public 2>&1 | tee publish.log; then
               echo "::notice::published $1@$2"
             elif grep -q "E_STAGE_REQUIRED\|stage-only\|npm stage" publish.log; then
