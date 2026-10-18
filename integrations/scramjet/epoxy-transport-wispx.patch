@@ -1,0 +1,19 @@
+--- a/src/main.ts
++++ b/src/main.ts
+@@ -14,6 +14,8 @@
+ 
+ export type EpoxyOptions = {
+ 	wisp_v2?: boolean;
++	/** Use WispX, falling back to Wisp v2/v1 on servers that don't support it. */
++	wispx?: boolean;
+ 	udp_extension_required?: boolean;
+ 
+ 	title_case_headers?: boolean;
+@@ -27,6 +29,7 @@
+ };
+ const opts = [
+ 	"wisp_v2",
++	"wispx",
+ 	"udp_extension_required",
+ 	"title_case_headers",
+ 	"ws_title_case_headers",
