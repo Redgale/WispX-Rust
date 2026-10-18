@@ -34,19 +34,23 @@ export function object_set(obj, k, v) {
 	try { obj[k] = v } catch {}
 };
 
+// "" would resolve against the page url, which can't take a POST when the page is a blob:,
+// data: or about:srcdoc document; the url is never fetched, only used to read the body
+const BODY_URL = "https://body.invalid/";
+
 export async function convert_body_inner(body) {
-	let req = new Request("", { method: "POST", duplex: "half", body });
+	let req = new Request(BODY_URL, { method: "POST", duplex: "half", body });
 	let type = req.headers.get("content-type");
 	return [new Uint8Array(await req.arrayBuffer()), type];
 }
 
 export async function convert_streaming_body_inner(body) {
 	try {
-		let req = new Request("", { method: "POST", body });
+		let req = new Request(BODY_URL, { method: "POST", body });
 		let type = req.headers.get("content-type");
 		return [false, new Uint8Array(await req.arrayBuffer()), type];
 	} catch(x) {
-		let req = new Request("", { method: "POST", duplex: "half", body });
+		let req = new Request(BODY_URL, { method: "POST", duplex: "half", body });
 		let type = req.headers.get("content-type");
 		return [true, req.body, type];
 	}
