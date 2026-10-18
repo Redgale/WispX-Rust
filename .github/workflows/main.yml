@@ -4,7 +4,10 @@ name: CI
 #   wispx-epoxy-tls        (client/, the epoxy client with WispX)
 #   wispx-epoxy-transport  (integrations/scramjet/epoxy-transport/, bundles the client)
 # On a push to main, the packages go up as a "latest" pre-release on GitHub, and each package
-# whose package.json version isn't on npm yet is published there (needs the NPM_TOKEN secret).
+# whose package.json version is new is published to npm (needs the NPM_TOKEN secret). With a
+# stage-only token, the release is staged instead and waits for approval on npmjs.com.
+# A version counts as new until it's on npm or has a "<package>@<version>" tag; the publish job
+# adds that tag, since a staged version isn't visible on npm until it's approved.
 
 on:
   push:
@@ -32,15 +35,17 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Check which versions are on npm
+      - name: Check which versions are new
         id: check
         run: |
           check() { # name dir key
             VERSION=$(jq -r .version "$2/package.json")
             PUBLISHED=$(npm view "$1@$VERSION" version 2>/dev/null || true)
-            echo "$1 $VERSION: ${PUBLISHED:+already on npm}${PUBLISHED:-not on npm yet}"
+            TAGGED=$(git ls-remote --tags origin "refs/tags/$1@$VERSION")
+            if [ -n "$PUBLISHED" ]; then STATE="on npm"; elif [ -n "$TAGGED" ]; then STATE="already published or staged (tag $1@$VERSION)"; else STATE="new"; fi
+            echo "$1 $VERSION: $STATE"
             echo "${3}_version=$VERSION" >> "$GITHUB_OUTPUT"
-            if [ -z "$PUBLISHED" ]; then echo "${3}_new=true" >> "$GITHUB_OUTPUT"; else echo "${3}_new=false" >> "$GITHUB_OUTPUT"; fi
+            if [ "$STATE" = "new" ]; then echo "${3}_new=true" >> "$GITHUB_OUTPUT"; else echo "${3}_new=false" >> "$GITHUB_OUTPUT"; fi
           }
           check wispx-epoxy-tls client client
           check wispx-epoxy-transport integrations/scramjet/epoxy-transport transport
@@ -156,6 +161,7 @@ jobs:
         if: needs.version-check.outputs.client_new == 'true'
         uses: ncipollo/release-action@v1
         with:
+          allowUpdates: true
           name: "${{ needs.version-check.outputs.client_version }}"
           tag: "v${{ needs.version-check.outputs.client_version }}"
           commit: ${{ github.sha }}
@@ -166,32 +172,58 @@ jobs:
     name: Publish to npm
     runs-on: ubuntu-latest
     needs: [version-check, build, transport]
+    permissions:
+      contents: write
     if: >-
       github.event_name == 'push' && github.ref == 'refs/heads/main' &&
       (needs.version-check.outputs.client_new == 'true' || needs.version-check.outputs.transport_new == 'true')
 
     steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
 
+      # staged publishing needs npm 11.15 or later; Node 22 comes with npm 10
+      - name: Update npm
+        run: npm install -g npm@11
+
       - name: Get artifacts
         uses: actions/download-artifact@v4
         with:
           pattern: epoxy-*-package
           merge-multiple: true
-          path: .
+          path: ./packages
 
-      - name: Publish wispx-epoxy-tls
-        if: needs.version-check.outputs.client_new == 'true'
-        run: npm publish wispx-epoxy-tls-${{ needs.version-check.outputs.client_version }}.tgz --access public
+      - name: Publish (or stage)
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-
-      - name: Publish wispx-epoxy-transport
-        if: needs.version-check.outputs.transport_new == 'true'
-        run: npm publish wispx-epoxy-transport-${{ needs.version-check.outputs.transport_version }}.tgz --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          CLIENT_NEW: ${{ needs.version-check.outputs.client_new }}
+          CLIENT_VERSION: ${{ needs.version-check.outputs.client_version }}
+          TRANSPORT_NEW: ${{ needs.version-check.outputs.transport_new }}
+          TRANSPORT_VERSION: ${{ needs.version-check.outputs.transport_version }}
+        run: |
+          set -o pipefail
+          npm --version
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          release() { # name version
+            TGZ="packages/$1-$2.tgz"
+            if npm publish "$TGZ" --access public 2>&1 | tee publish.log; then
+              echo "::notice::published $1@$2"
+            elif grep -q "E_STAGE_REQUIRED\|stage-only\|npm stage" publish.log; then
+              npm stage publish "$TGZ" --access public
+              echo "::notice::staged $1@$2: approve it on npmjs.com (Staged Packages) or with npm stage approve"
+            else
+              exit 1
+            fi
+            # mark it as done; a staged version isn't visible on npm until it's approved
+            git tag "$1@$2" && git push origin "refs/tags/$1@$2"
+          }
+          # the client first: the transport depends on it
+          if [ "$CLIENT_NEW" = "true" ]; then release wispx-epoxy-tls "$CLIENT_VERSION"; fi
+          if [ "$TRANSPORT_NEW" = "true" ]; then release wispx-epoxy-transport "$TRANSPORT_VERSION"; fi
