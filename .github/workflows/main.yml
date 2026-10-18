@@ -79,6 +79,8 @@ jobs:
         with:
           name: epoxy-client-package
           path: ./client/wispx-epoxy-tls-*.tgz
+          # a package named differently than expected must fail here, not in a later job
+          if-no-files-found: error
 
   transport:
     name: Build Transport
@@ -114,6 +116,8 @@ jobs:
         with:
           name: epoxy-transport-package
           path: ./integrations/scramjet/epoxy-transport/wispx-epoxy-transport-*.tgz
+          # a package named differently than expected must fail here, not in a later job
+          if-no-files-found: error
 
   upload:
     name: Upload release
